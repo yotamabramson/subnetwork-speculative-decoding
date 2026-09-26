@@ -60,6 +60,7 @@ def main(argv=None):
     t.add_argument("--max-nodes", type=int)
     t.add_argument("--temperature", type=float)
     t.add_argument("--top-p", type=float)
+    t.add_argument("--draft-vocab", type=int, help="draft scores the N most frequent tokens; 0 = full vocab")
     b = p.add_mutually_exclusive_group()
     b.add_argument("--bridges", help="explicit bridge checkpoint path")
     b.add_argument("--untrained", action="store_true", help="use freshly initialised bridges")
@@ -67,9 +68,12 @@ def main(argv=None):
 
     setup_env()
     cfg = SSDConfig.from_yaml(args.config)
-    overrides = {k: getattr(args, k) for k in ("depth", "branch", "width", "max_nodes", "temperature", "top_p") if getattr(args, k) is not None}
+    overrides = {k: getattr(args, k) for k in ("depth", "branch", "width", "max_nodes", "temperature", "top_p", "draft_vocab") if getattr(args, k) is not None}
+    if overrides.get("draft_vocab") == 0:
+        overrides["draft_vocab"] = None
     dcfg = replace(cfg.drafting, **overrides)
     dcfg.validate()
+    cfg.drafting = dcfg
     prompt = args.prompt if args.prompt is not None else open(args.prompt_file).read()
 
     base = load_base_model(cfg)
@@ -86,7 +90,7 @@ def main(argv=None):
 
     print(f"\nprompt: {ids.shape[1]} tokens | device: {dev} | draft layers {profile_name(cfg.draft_layers)} ({len(cfg.draft_layers)}/{L})")
     print(f"tree: depth={dcfg.depth} branch={dcfg.branch} width={dcfg.width} max_nodes={dcfg.max_nodes} "
-          f"temperature={dcfg.temperature} top_p={dcfg.top_p}")
+          f"temperature={dcfg.temperature} top_p={dcfg.top_p} draft_vocab={dcfg.draft_vocab or 'full'}")
 
     def run_ar(model, n, seed):
         return autoregressive_generate(model, ids, n, eos_ids, dcfg.temperature, dcfg.top_p, seed)

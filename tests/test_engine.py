@@ -63,6 +63,24 @@ def test_greedy_sd_matches_autoregressive(base, tree_name, draft_kind):
             assert res.mean_accepted > TREES[tree_name].depth  # ~depth+1 per round
 
 
+def test_greedy_sd_with_draft_vocab_subset(base):
+    """Restricting the draft to a token subset may lower acceptance but never changes output."""
+    from ssd.data.token_freq import top_vocab
+
+    target = TargetRunner(base)
+    draft = SubnetworkDraftModel(base, list(range(6)))
+    counts = torch.arange(128).flip(0)  # pretend low ids are frequent
+    draft.set_vocab_subset(top_vocab(counts, 40, always={127}))
+    assert draft.vocab_ids.numel() == 40 and 127 in draft.vocab_ids.tolist()
+    ids = torch.randint(0, 128, (1, 7), generator=torch.Generator().manual_seed(5))
+    ref = autoregressive_generate(target, ids, 40, {-1}).tokens
+    res = SpeculativeGenerator(base, draft, TREES["tree"], target).generate(ids, 40, {-1})
+    assert res.tokens == ref
+    with torch.no_grad():
+        out = draft(ids)
+    assert out.logits.shape[-1] == 40 and out.vocab_ids is draft.vocab_ids
+
+
 def test_greedy_sd_stops_at_eos(base):
     target = TargetRunner(base)
     ids = torch.randint(0, 128, (1, 6), generator=torch.Generator().manual_seed(0))
@@ -110,11 +128,12 @@ def test_tree_shape_limits(base):
     assert cache.get_seq_length() == 3 + drafter.max_tree_cache()
 
 
-@pytest.mark.parametrize("tree_cfg", [
-    DraftingConfig(depth=2, branch=[2, 2], temperature=1.0),
-    DraftingConfig(depth=2, branch=1, temperature=0.8, top_p=0.9),
+@pytest.mark.parametrize("tree_cfg,vocab_subset", [
+    (DraftingConfig(depth=2, branch=[2, 2], temperature=1.0), None),
+    (DraftingConfig(depth=2, branch=1, temperature=0.8, top_p=0.9), None),
+    (DraftingConfig(depth=2, branch=[2, 2], temperature=1.0), [0, 2, 3, 5, 6]),  # draft can't propose 1, 4, 7
 ])
-def test_sampling_sd_matches_target_distribution(tree_cfg):
+def test_sampling_sd_matches_target_distribution(tree_cfg, vocab_subset):
     """Tokens 2 and 3 come from one speculative round (token 1 from prefill).
     Compare their empirical joint with the target's exact joint."""
     from ssd.engine.tree_drafter import warp_probs
@@ -122,6 +141,8 @@ def test_sampling_sd_matches_target_distribution(tree_cfg):
     V = 8
     base = tiny(vocab=V, seed=1, scale=8.0)  # sharper than uniform, still multi-modal
     draft = SubnetworkDraftModel(base, [0, 5], BridgeConfig(init_std=0.05))
+    if vocab_subset is not None:
+        draft.set_vocab_subset(torch.tensor(vocab_subset))
     target = TargetRunner(base)
     prompt = torch.tensor([[1, 5, 2]])
     T, P = tree_cfg.temperature, tree_cfg.top_p

@@ -97,6 +97,9 @@ class DraftingConfig:
     max_nodes: Optional[int] = None  # None -> verify every node
     temperature: float = 0.0  # 0 -> greedy (exact-match verification)
     top_p: float = 1.0
+    # Draft scores only the N most frequent training tokens (None = full vocab).
+    # Verification always uses the full vocab, so outputs are unaffected.
+    draft_vocab: Optional[int] = None
 
     def per_depth(self, value: Optional[IntOrList], name: str) -> list[Optional[int]]:
         if value is None or isinstance(value, int):
@@ -114,6 +117,8 @@ class DraftingConfig:
             raise ValueError("drafting.width entries must be >= 1")
         if self.max_nodes is not None and self.max_nodes < 1:
             raise ValueError("drafting.max_nodes must be >= 1")
+        if self.draft_vocab is not None and self.draft_vocab < 1:
+            raise ValueError("drafting.draft_vocab must be >= 1 (or null)")
         if not 0.0 < self.top_p <= 1.0 or self.temperature < 0:
             raise ValueError("need temperature >= 0 and 0 < top_p <= 1")
 

@@ -50,7 +50,15 @@ drafting:                    # the speculation tree
   max_nodes: 24              # nodes sent to the target for verification (null = all)
   temperature: 0.0           # 0 = greedy
   top_p: 1.0
+  draft_vocab: null          # e.g. 32768: draft scores only the most frequent tokens
 ```
+
+`draft_vocab` targets the draft's biggest cost: the 128k-row `lm_head` is
+~60% of a draft step on Llama-3.2-1B. EAGLE-3 uses the same trick. The
+verification still uses the full vocabulary, so outputs are unchanged, and
+tokens outside the subset simply can't be drafted. Frequencies come from the
+training data (`ssd-train` writes `{output_dir}/token_freq.pt`; or run
+`python -m ssd.data.token_freq --config ...`).
 
 `branch: 1` gives a plain chain of `depth` tokens. Bridges are saved to
 `{output_dir}/{profile}/stage{1,2}.pt`, where the profile is named after the
