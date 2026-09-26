@@ -18,6 +18,12 @@ The decoder-layer forward is re-implemented on top of the layer's own
 submodules (q/k/v/o_proj, norms, mlp) rather than calling
 ``LlamaDecoderLayer.forward``. That gives us arbitrary tree attention masks,
 our own KV cache, and independence from HF's cache/mask API churn.
+
+KV caching is keyed by *base* layer index, so at inference the draft shares
+the target's cache. Its layers attend to the target's real keys/values for
+every committed token and only add entries for the speculative tokens they
+process. ``true_layer_inputs`` reproduces exactly that situation in training:
+position t attends to the target's KV for positions < t and to its own KV at t.
 """
 
 from __future__ import annotations
@@ -138,7 +144,9 @@ class SubnetworkDraftModel(nn.Module):
         return len(self.layer_indices)
 
     def new_cache(self, max_length: int) -> KVCache:
-        return KVCache(self.num_layers, max_length)
+        """Cache with a slot per *base* layer (only the selected ones get allocated),
+        so the same cache can be shared with the full target."""
+        return KVCache(self.num_base_layers, max_length)
 
     @staticmethod
     def _build_attn_mask(
@@ -176,23 +184,32 @@ class SubnetworkDraftModel(nn.Module):
         sin: torch.Tensor,
         attn_mask: Optional[torch.Tensor],
         cache: Optional[KVCache],
+        true_input: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         layer = self.base.layers[slot]
         attn = layer.self_attn
         bsz, q_len, _ = h.shape
+        cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
+
+        def kv(x):
+            k = attn.k_proj(x).view(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            v = attn.v_proj(x).view(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            return k * cos + _rotate_half(k) * sin, v
 
         residual = h
         x = layer.input_layernorm(h)
         q = attn.q_proj(x).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = attn.k_proj(x).view(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = attn.v_proj(x).view(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-
-        cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
         q = q * cos + _rotate_half(q) * sin
-        k = k * cos + _rotate_half(k) * sin
+        k, v = kv(x)
 
         if cache is not None:
-            k, v = cache.update(slot, k, v)
+            k, v = cache.update(self.layer_indices[slot], k, v)
+        elif true_input is not None:
+            # Keys: target's KV for positions < t, then the draft's own KV at t.
+            k_t, v_t = kv(layer.input_layernorm(true_input.to(h.device, h.dtype)))
+            k, v = torch.cat([k_t, k], dim=2), torch.cat([v_t, v], dim=2)
+            idx = torch.arange(q_len, device=h.device)
+            attn_mask = torch.cat([idx[None, :] < idx[:, None], torch.eye(q_len, dtype=torch.bool, device=h.device)], 1)
 
         n_rep = self.num_heads // self.num_kv_heads
         if n_rep > 1:
@@ -220,6 +237,7 @@ class SubnetworkDraftModel(nn.Module):
         logits_to_keep: int = 0,
         compute_logits: bool = True,
         output_bridge_states: bool = False,
+        true_layer_inputs: Optional[dict[int, torch.Tensor]] = None,
     ) -> DraftOutput:
         """Run the draft sub-network.
 
@@ -237,7 +255,13 @@ class SubnetworkDraftModel(nn.Module):
                 (the 128k-vocab lm_head is a large share of draft cost).
             compute_logits: skip the lm_head entirely (e.g. Stage 1 feature losses).
             output_bridge_states: return each bridge's output (for Stage 1/2 losses).
+            true_layer_inputs: training only (no cache). ``{base_layer: [B, T, d]}``,
+                the target's own input to each selected layer (``TargetWrapper``
+                boundary taps). Position t then attends to keys/values computed from
+                these for positions < t, exactly as at inference with a shared cache.
         """
+        if true_layer_inputs is not None and past_key_values is not None:
+            raise ValueError("true_layer_inputs is for training without a cache")
         if inputs_embeds is None:
             inputs_embeds = self.base.embed_tokens(input_ids)
         h = inputs_embeds
@@ -269,6 +293,7 @@ class SubnetworkDraftModel(nn.Module):
                 sin.to(dev),
                 attn_mask.to(dev) if attn_mask is not None else None,
                 past_key_values,
+                true_layer_inputs[self.layer_indices[slot]] if true_layer_inputs is not None else None,
             )
 
         if self._pre_norm_bridge is not None:

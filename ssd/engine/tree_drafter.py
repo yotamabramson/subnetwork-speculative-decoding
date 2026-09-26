@@ -1,10 +1,9 @@
 """Dynamic tree drafting with the sub-network draft.
 
-One round, given the committed tokens the draft hasn't seen yet ("pending",
-whose last token is the tree root):
+One round. The cache holds the target's real KV for the committed prefix, and
+``pending`` is the last committed token (the tree root):
 
-1. Feed ``pending`` causally. The last position's logits give the root's
-   next-token distribution.
+1. Feed ``pending``. Its logits give the root's next-token distribution.
 2. For depth d = 1..K: every node kept at depth d-1 proposes ``branch[d]``
    children. With greedy decoding these are the top tokens; with sampling they
    are drawn without replacement (Gumbel top-k), in draw order. Across the
@@ -176,7 +175,8 @@ class TreeDrafter:
             if d == self.cfg.depth - 1 or not level:
                 break
 
-            # Feed this level through the draft in one batched forward.
+            # Feed this level through the draft in one batched forward. Nodes attend
+            # to the committed prefix (the target's KV) plus their own ancestors.
             past = cache.get_seq_length()
             for j, i in enumerate(level):
                 tree.draft_pos[i] = past + j

@@ -9,7 +9,6 @@ Modes:
           `drafting:` (overridable by flags), timed against plain autoregressive
           decoding of the target. Reports accepted tokens per round and speedup.
   target  autoregressive target only
-  draft   the draft sub-network generating on its own (to eyeball bridge quality)
 
 Bridges load from {output_dir}/{profile}/stage2.pt (else stage1.pt), unless
 --bridges or --untrained is given.
@@ -49,7 +48,7 @@ def main(argv=None):
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--prompt")
     g.add_argument("--prompt-file")
-    p.add_argument("--mode", choices=["sd", "target", "draft"], default="sd")
+    p.add_argument("--mode", choices=["sd", "target"], default="sd")
     p.add_argument("--max-new-tokens", type=int, default=256)
     p.add_argument("--raw", action="store_true", help="don't wrap the prompt in the chat template")
     p.add_argument("--seed", type=int, default=0)
@@ -82,7 +81,7 @@ def main(argv=None):
     L = base.config.num_hidden_layers
     target = TargetRunner(base)
     draft = None
-    if args.mode in ("sd", "draft"):
+    if args.mode == "sd":
         draft = build_draft(cfg, base, None if args.untrained else (args.bridges or "latest"))
 
     print(f"\nprompt: {ids.shape[1]} tokens | device: {dev} | draft layers {profile_name(cfg.draft_layers)} ({len(cfg.draft_layers)}/{L})")
@@ -91,13 +90,6 @@ def main(argv=None):
 
     def run_ar(model, n, seed):
         return autoregressive_generate(model, ids, n, eos_ids, dcfg.temperature, dcfg.top_p, seed)
-
-    if args.mode == "draft":
-        # Autoregressive generation with the draft alone.
-        res = run_ar(draft, args.max_new_tokens, args.seed)
-        print(f"\n=== draft only: {len(res.tokens)} tokens, {len(res.tokens) / res.decode_time:.1f} tok/s ===")
-        print(tokenizer.decode(res.tokens, skip_special_tokens=True))
-        return
 
     if not args.no_warmup:  # first MPS/CUDA calls include kernel compilation
         run_ar(target, 8, args.seed)
@@ -121,7 +113,15 @@ def main(argv=None):
     print(f"rounds:                {rounds}")
     print(f"accepted tokens/round: {sd.mean_accepted:.2f}   (incl. bonus; max {dcfg.depth + 1})")
     print(f"mean tree size:        {sum(sd.tree_sizes) / max(1, rounds):.1f} nodes")
-    per = {k: 1000 * v / max(1, rounds) for k, v in sd.times.items() if k not in ("prefill", "draft_prefill")}
+    # Per-depth acceptance: of the rounds that accepted depth d-1, how many also accepted depth d.
+    acc = [n - 1 for n in sd.accepted_per_round]  # drafted tokens accepted (bonus excluded)
+    parts = []
+    for d in range(1, dcfg.depth + 1):
+        reached = sum(a >= d - 1 for a in acc)
+        if reached:
+            parts.append(f"d{d}={sum(a >= d for a in acc) / reached:.0%}")
+    print("accept rate by depth:  " + "  ".join(parts) + "   (given all shallower depths accepted)")
+    per = {k: 1000 * v / max(1, rounds) for k, v in sd.times.items() if k != "prefill"}
     print("per round:             " + "  ".join(f"{k}={v:.1f}ms" for k, v in per.items()))
     print(f"target step (AR):      {1000 * ar.decode_time / max(1, len(ar.tokens) - 1):.1f}ms/token")
     print(f"throughput:            AR {ar_tps:.1f} tok/s  |  SD {sd_tps:.1f} tok/s  |  speedup {sd_tps / ar_tps:.2f}x")

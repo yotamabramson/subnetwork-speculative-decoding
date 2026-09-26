@@ -5,10 +5,18 @@ The target runs through ``SubnetworkDraftModel`` with *all* layers selected
 masks and cache compaction, and it matches HF ``LlamaForCausalLM`` exactly
 (see tests). The baseline uses the same path, so speedups compare like with like.
 
-Cache invariants between rounds (batch size 1):
-  target cache = committed[:-1]; the last committed token is the next root.
-  draft cache  = committed[:len - n_pending]; ``pending`` holds the rest
-                 (always ends with the root).
+One KV cache, shared by target and draft (batch size 1). Between rounds it
+holds the target's real KV, for every layer, of all committed tokens except the
+last one, the root. Each round:
+
+1. Draft: the draft layers process the root, then the tree level by level. They
+   attend to the target's real KV for the committed prefix and append entries
+   (at their own layers only) for the speculative tokens.
+2. Crop the cache back to the committed prefix, which discards the draft's
+   speculative entries.
+3. Verify: the target processes the root plus the tree in one forward, writing
+   real KV for all of them. Keep the root and the accepted path; the bonus token
+   becomes the next root.
 """
 
 from __future__ import annotations
@@ -135,38 +143,29 @@ class SpeculativeGenerator:
         timer = _Timer(dev)
         n_prompt = input_ids.shape[1]
         # Slack: one round can overshoot max_new_tokens by up to depth+1 tokens.
-        t_cache = self.target.new_cache(n_prompt + max_new_tokens + cfg.depth + self.drafter.max_verify_nodes() + 2)
-        d_cache = self.draft.new_cache(n_prompt + max_new_tokens + 2 * cfg.depth + self.drafter.max_tree_cache() + 2)
+        extra = max(self.drafter.max_verify_nodes(), self.drafter.max_tree_cache()) + 1
+        cache = self.target.new_cache(n_prompt + max_new_tokens + cfg.depth + extra + 1)
 
         with timer("prefill"):
-            logits = self.target(input_ids, past_key_values=t_cache, logits_to_keep=1).logits[0, -1]
+            logits = self.target(input_ids, past_key_values=cache, logits_to_keep=1).logits[0, -1]
             out = [_first_token(logits, cfg.temperature, cfg.top_p, gen)]
-        with timer("draft_prefill"):
-            self.draft(input_ids, past_key_values=d_cache, compute_logits=False)
-        pending = [out[-1]]
         result = GenerationResult(tokens=[], times=timer.totals)
 
         while not _finish(out, eos_ids, max_new_tokens)[1]:
-            root_pos = n_prompt + len(out) - 1
+            committed = cache.get_seq_length()  # == position of the root
             with timer("draft"):
-                tree = self.drafter.build(d_cache, torch.tensor([pending], device=dev), root_pos, gen)
+                tree = self.drafter.build(cache, torch.tensor([[out[-1]]], device=dev), committed, gen)
+                cache.crop(committed)
             with timer("verify"):
-                t_past = t_cache.get_seq_length()
-                ids, pos, mask = verify_inputs(tree, out[-1], root_pos, t_past, dev)
-                logits = self.target(ids, position_ids=pos, past_key_values=t_cache, tree_attention_mask=mask).logits[0]
+                ids, pos, mask = verify_inputs(tree, out[-1], committed, committed, dev)
+                logits = self.target(ids, position_ids=pos, past_key_values=cache, tree_attention_mask=mask).logits[0]
                 if cfg.temperature == 0:
                     accepted, bonus = greedy_verify(tree, logits)
                 else:
                     accepted, bonus = sample_verify(tree, logits, cfg.temperature, cfg.top_p, gen)
             with timer("bookkeeping"):
-                # Target: keep root + accepted path; the bonus is the next root.
-                t_cache.keep_positions(t_past, torch.tensor([t_past] + [t_past + 1 + i for i in accepted]))
-                # Draft: keep the accepted nodes it already processed (a prefix of the
-                # path); the rest of the path plus the bonus become pending.
-                fed = [tree.draft_pos[i] for i in accepted if tree.draft_pos[i] >= 0]
-                d_cache.keep_positions(tree.cache_start, torch.tensor(fed, dtype=torch.long))
+                cache.keep_positions(committed, torch.tensor([committed] + [committed + 1 + i for i in accepted]))
                 new = [tree.tokens[i] for i in accepted] + [bonus]
-                pending = new[len(fed):]
                 out.extend(new)
                 result.accepted_per_round.append(len(new))
                 result.tree_sizes.append(len(tree))

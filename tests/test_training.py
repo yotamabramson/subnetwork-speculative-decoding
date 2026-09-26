@@ -152,7 +152,7 @@ def test_activation_cache_roundtrip_and_stage1_from_cache(tiny_setup, tmp_path):
     cfg, base = tiny_setup
     meta = extract(cfg, base, CharTokenizer(), str(tmp_path / "acts"), num_rows=12, rows_per_shard=8)
     assert meta["num_rows"] == 12 and meta["num_shards"] == 2
-    assert meta["boundaries"] == [1, 3, 4, 5]  # into_3: 1->3, into_5: 4->5
+    assert meta["boundaries"] == [0, 1, 3, 4, 5]  # bridge endpoints + selected-layer inputs
     ids, acts = next(cached_batches(str(tmp_path / "acts"), 4, [1, 3]))
     assert ids.shape == (4, 32) and acts[3].shape == (4, 32, 64)
 

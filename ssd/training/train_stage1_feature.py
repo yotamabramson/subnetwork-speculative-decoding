@@ -6,8 +6,9 @@ For every bridge ``src -> tgt`` in a profile, minimise
 
 * ``mode: teacher`` — the bridge input is the target's own ``h_src``. The
   bridges train independently and see clean inputs.
-* ``mode: chained`` — the bridge input comes from running the draft itself,
-  so upstream errors propagate, as they will at inference.
+* ``mode: chained`` — the bridge input comes from running the draft itself
+  (attending to the target's KV for past positions, as at inference), so
+  upstream errors within the current token propagate.
 
 Activations come from the frozen target, computed online, or from a cache
 written by ``ssd.data.extract_activations``.
@@ -47,8 +48,9 @@ class _Chained(nn.Module):
         super().__init__()
         self.draft = draft
 
-    def forward(self, input_ids: torch.Tensor) -> dict[str, torch.Tensor]:
-        return self.draft(input_ids, compute_logits=False, output_bridge_states=True).bridge_states
+    def forward(self, input_ids: torch.Tensor, taps: dict[int, torch.Tensor]) -> dict[str, torch.Tensor]:
+        true_inputs = {i: taps[i] for i in self.draft.layer_indices}
+        return self.draft(input_ids, compute_logits=False, output_bridge_states=True, true_layer_inputs=true_inputs).bridge_states
 
 
 def _activation_batches(cfg, base, tokenizer, boundaries, batch_size, rank, world) -> Iterator[tuple[torch.Tensor, dict]]:
@@ -91,7 +93,10 @@ def train_stage1(
         module, opt = accelerator.prepare(module, opt)
         rank, world, is_main = accelerator.process_index, accelerator.num_processes, accelerator.is_main_process
 
-    boundaries = sorted({b for s in draft.bridge_specs for b in (s.src_boundary, s.tgt_boundary)})
+    boundaries = {b for s in draft.bridge_specs for b in (s.src_boundary, s.tgt_boundary)}
+    if s1.mode == "chained":
+        boundaries |= set(layers)
+    boundaries = sorted(boundaries)
     batches = _activation_batches(cfg, base, tokenizer, boundaries, s1.batch_size, rank, world)
     n_params = sum(p.numel() for p in draft.parameters())
     if is_main:
@@ -102,7 +107,11 @@ def train_stage1(
     module.train()
     for step in range(steps):
         ids, taps = next(batches)
-        preds = module(taps) if s1.mode == "teacher" else module(ids.to(input_device(base)))
+        if s1.mode == "teacher":
+            preds = module(taps)
+        else:
+            dev = input_device(base)
+            preds = module(ids.to(dev), {b: t.to(dev) for b, t in taps.items()})
         total = 0.0
         stats: dict[str, float] = {}
         for spec in draft.bridge_specs:

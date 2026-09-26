@@ -74,6 +74,29 @@ def test_greedy_sd_stops_at_eos(base):
     assert res.tokens == ref and res.tokens[-1] in eos
 
 
+@pytest.mark.parametrize("layers", [[0, 3, 5], [1, 2, 4]])
+def test_training_mode_matches_shared_cache_inference(base, layers):
+    """Draft logits at position t in training (true_layer_inputs = target's own
+    layer inputs) must equal inference: target prefills ids[:t] into the shared
+    cache, then the draft processes token t on top of it."""
+    from ssd.models.target_wrapper import TargetWrapper
+
+    draft = SubnetworkDraftModel(base, layers, BridgeConfig(init_std=0.05))
+    target = TargetRunner(base)
+    ids = torch.randint(0, 128, (1, 16), generator=torch.Generator().manual_seed(3))
+    with torch.no_grad():
+        taps = TargetWrapper(base)(ids, boundaries=layers, compute_logits=False).boundaries
+        train_logits = draft(ids, true_layer_inputs=taps).logits
+        for t in (0, 1, 7, 15):
+            cache = target.new_cache(32)
+            if t > 0:
+                target(ids[:, :t], past_key_values=cache)
+            inf = draft(ids[:, t : t + 1], past_key_values=cache).logits[0, -1]
+            torch.testing.assert_close(train_logits[0, t], inf, atol=1e-4, rtol=1e-4)
+        # Differs from the old self-contained draft (own bridged KV for the prefix).
+        assert not torch.allclose(train_logits, draft(ids).logits, atol=1e-3)
+
+
 def test_tree_shape_limits(base):
     draft = SubnetworkDraftModel(base, [0, 3, 5])
     cfg = TREES["pruned"]

@@ -37,7 +37,8 @@ def extract(cfg: SSDConfig, base, tokenizer, out_dir: str, num_rows: int, rows_p
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     L = base.config.num_hidden_layers
-    boundaries = sorted(required_boundaries(cfg.draft_layers, L))
+    # Bridge endpoints, plus the selected layers' inputs (needed by stage1 chained mode).
+    boundaries = sorted(required_boundaries(cfg.draft_layers, L) | set(cfg.draft_layers))
     tw = TargetWrapper(base)
     device = base.model.embed_tokens.weight.device
 

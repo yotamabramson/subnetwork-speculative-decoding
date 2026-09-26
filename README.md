@@ -32,7 +32,7 @@ ssd-train --config configs/llama32_1b_subnetwork.yaml
 # 2) speculative decoding on a test prompt, timed against plain autoregressive decoding
 ssd-run --config configs/llama32_1b_subnetwork.yaml --prompt "Explain KV caches."
 ssd-run --config ... --prompt "..." --depth 6 --branch 4,2,2,1,1,1 --max-nodes 32   # tree overrides
-ssd-run --config ... --prompt "..." --mode draft      # draft alone, to eyeball bridge quality
+ssd-run --config ... --prompt "..." --mode target     # plain autoregressive target only
 ```
 
 ## Configuration
@@ -59,13 +59,26 @@ bridges.
 
 ## Speculative decoding
 
-Each round:
-1. The draft grows the tree level by level, one batched forward per level.
-   Each node attends only to the committed prefix and its own ancestors.
-2. The target scores the root plus every tree node in one forward with a
-   tree attention mask.
-3. Verification walks down from the root, then both KV caches are compacted
-   to the accepted path.
+There is one KV cache, shared by the target and the draft. The draft's layers
+(e.g. 0, 7, 15) are the target's own layers, so they read the target's real
+keys/values for the entire committed context. There's no draft prefill and no
+separate draft cache.
+
+1. **Prefill:** the target processes the prompt.
+2. **Draft:** starting from the last committed token, the draft grows the tree
+   level by level, one batched forward per level. Each node attends to the
+   committed context plus its own ancestors. The draft writes KV only for the
+   speculative tokens, at its own layers, and those entries are discarded
+   afterwards.
+3. **Verify:** the target scores the root plus every tree node in one forward
+   with a tree attention mask, writing real KV for them. The cache keeps the
+   root and the accepted path.
+
+Training matches this. Stage 2, and Stage 1 in `chained` mode, pass the
+target's own layer inputs as `true_layer_inputs`, so position t attends to
+the target's KV for positions < t and to the draft's own state only at t. A
+test checks that the training-mode logits equal the shared-cache inference
+logits.
 
 - **Greedy** (`temperature: 0`): a child is accepted when it equals the
   target's argmax. The output is identical to plain greedy decoding with the
