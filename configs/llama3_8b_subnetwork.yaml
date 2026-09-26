@@ -1,0 +1,35 @@
+model:
+  base_model: meta-llama/Meta-Llama-3-8B-Instruct
+  # 0-indexed. Llama-3-8B has 32 decoder layers (0..31), so the first/middle/last
+  # selection written 1-indexed as {1, 16, 32} is [0, 15, 31] here.
+  layer_indices: [0, 15, 31]
+  torch_dtype: bfloat16
+  device_map: null
+  attn_implementation: sdpa
+
+bridge:
+  mlp_type: mlp          # mlp | swiglu
+  num_layers: 2          # 2 or 3 for mlp
+  hidden_dim: null       # null -> d_model (4096); smaller = bottleneck, larger = expansion
+  activation: silu
+  bias: true
+  init_std: 1.0e-3       # output projection std -> bridge starts ~identity
+  norm_eps: 1.0e-5
+  dtype: float32
+
+training:
+  stage1:
+    alpha_mse: 1.0
+    beta_cos: 1.0
+    lr: 1.0e-4
+    seq_len: 2048
+  stage2:
+    temperature: 2.0
+    kd_weight: 1.0
+    ce_weight: 0.1
+    lr: 3.0e-5
+
+drafting:
+  max_depth: 6           # K
+  top_k_per_node: 4
+  total_tokens: 60       # tree budget per verification step

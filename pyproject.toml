@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ssd"
+version = "0.1.0"
+description = "Subnetwork Speculative Decoding: draft with a frozen layer subset of the target LLM, joined by learned bridges"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.3",
+    "transformers>=4.56",
+    "accelerate>=0.30",
+    "datasets>=2.19",
+    "pyyaml>=6.0",
+    "safetensors>=0.4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+include = ["ssd*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["llama3_8b: loads real Llama-3-8B-Instruct weights (set SSD_TEST_LLAMA3_8B=1)"]
