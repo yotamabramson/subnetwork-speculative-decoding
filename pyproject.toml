@@ -15,6 +15,7 @@ dependencies = [
     "datasets>=2.19",
     "pyyaml>=6.0",
     "safetensors>=0.4",
+    "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]
@@ -26,3 +27,7 @@ include = ["ssd*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["llama3_8b: loads real Llama-3-8B-Instruct weights (set SSD_TEST_LLAMA3_8B=1)"]
+
+[project.scripts]
+ssd-train = "ssd.cli.train:main"
+ssd-run = "ssd.cli.run:main"

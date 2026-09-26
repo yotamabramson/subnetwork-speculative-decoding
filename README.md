@@ -20,32 +20,117 @@ Training has two stages:
 2. **Logit distillation.** The draft is trained end to end with KL divergence
    at temperature T=2 against the target, plus ground-truth cross-entropy.
 
+## Quick start (Mac / MPS, Llama-3.2-1B)
+
+```bash
+python3.11 -m venv .venv && .venv/bin/pip install -e ".[dev]"
+echo "HF_TOKEN=hf_..." > .env        # gated meta-llama repos; loaded at runtime, git-ignored
+
+# 1) train the bridges (stage 1 then stage 2)
+ssd-train --config configs/llama32_1b_subnetwork.yaml
+
+# 2) speculative decoding on a test prompt, timed against plain autoregressive decoding
+ssd-run --config configs/llama32_1b_subnetwork.yaml --prompt "Explain KV caches."
+ssd-run --config ... --prompt "..." --depth 6 --branch 4,2,2,1,1,1 --max-nodes 32   # tree overrides
+ssd-run --config ... --prompt "..." --mode draft      # draft alone, to eyeball bridge quality
+```
+
+## Configuration
+
+Each model has one YAML. The draft is a single subset of base layers, used for
+every draft step (per-step subsets aren't supported):
+
+```yaml
+draft_layers: [0, 7, 15]     # 0-based
+
+drafting:                    # the speculation tree
+  depth: 4                   # K: tokens drafted ahead per round
+  branch: [3, 2, 2, 1]       # children proposed per kept node, per depth (int = same everywhere)
+  width: 8                   # nodes kept per depth, by cumulative draft log-prob (null = no cap)
+  max_nodes: 24              # nodes sent to the target for verification (null = all)
+  temperature: 0.0           # 0 = greedy
+  top_p: 1.0
+```
+
+`branch: 1` gives a plain chain of `depth` tokens. Bridges are saved to
+`{output_dir}/{profile}/stage{1,2}.pt`, where the profile is named after the
+layers (e.g. `L0-7-15`), so changing `draft_layers` never loads mismatched
+bridges.
+
+## Speculative decoding
+
+Each round:
+1. The draft grows the tree level by level, one batched forward per level.
+   Each node attends only to the committed prefix and its own ancestors.
+2. The target scores the root plus every tree node in one forward with a
+   tree attention mask.
+3. Verification walks down from the root, then both KV caches are compacted
+   to the accepted path.
+
+- **Greedy** (`temperature: 0`): a child is accepted when it equals the
+  target's argmax. The output is identical to plain greedy decoding with the
+  target, and tests check this for chains, trees, pruned trees and bad drafts.
+- **Sampling:** multi-candidate speculative sampling without replacement. It
+  reproduces the target's distribution exactly for unpruned trees, and a test
+  checks this statistically. `width`/`max_nodes` pruning makes it near-exact,
+  the same trade-off EAGLE-2 makes.
+- **Every round** commits the accepted tokens plus one bonus token from the
+  target.
+
+The target runs through the same layer implementation as the draft (all
+layers, no bridges), which matches HF exactly. The autoregressive baseline
+uses the same path, so speedups compare like with like.
+
+## Training
+
+- **Stage 1 (feature regression).** The frozen target runs on real text, and
+  its residual stream is recorded at each bridge's endpoints. The input is the
+  output of the selected layer before the gap. The target is the input the
+  next selected layer normally sees. Loss: `α·relMSE + β·(1 − cos)`, with
+  position 0 (the attention sink) excluded. Two modes:
+  - `mode: teacher` (default): bridges see the target's clean activations.
+  - `mode: chained`: bridges see the draft's own upstream output.
+
+  Activations are computed online by default. Alternatively,
+  `python -m ssd.data.extract_activations` writes a disk cache that
+  `stage1.activation_cache` points at.
+- **Stage 2 (distillation).** The full draft runs on real text, trained with
+  KL divergence (T=2) against the target's logits plus next-token CE. Logs
+  include `top1_agree`, which is the depth-1 greedy acceptance rate.
+- **Multi-GPU:** `accelerate launch -m ssd.cli.train --config ...` (DDP). For
+  70B, use `model.device_map: auto` in a single process instead.
+
 ## Layout
 
 ```
-configs/                 llama3_8b_subnetwork.yaml, llama3_70b_subnetwork.yaml
+configs/                 llama32_1b (dev), llama3_8b, llama3_70b
 ssd/
-  config.py              SSDConfig (YAML) + layer-index validation
+  config.py              SSDConfig (YAML): draft_layers K->layers, bridge, data, training
+  runtime.py             model loading, device selection, checkpoint layout
+  cli/train.py           ssd-train entry point
+  cli/run.py             ssd-run entry point
   models/
     bridges.py           TransitionBridge (mlp 2–3 layers / swiglu; bottleneck or expansion)
     subnetwork_draft.py  SubnetworkDraftModel: sliced frozen layers + bridges
     target_wrapper.py    TargetWrapper: taps residual-stream boundaries of the target
   engine/
-    kv_cache.py          DraftKVCache: preallocated per-slot cache with tree compaction
-    tree_drafter.py      (todo) dynamic tree expansion
-    verify.py            (todo) greedy + stochastic verification
-  data/extract_activations.py      (todo)
-  training/train_stage1_feature.py (todo)
-  training/train_stage2_distill.py (todo)
+    kv_cache.py          KVCache: preallocated per-layer cache with tree-path compaction
+    tree_drafter.py      TreeDrafter: level-by-level tree growth (branch / width / max_nodes)
+    verify.py            tree mask construction; greedy + speculative-sampling verification
+    speculative.py       SpeculativeGenerator loop, TargetRunner, autoregressive baseline
+  data/text_stream.py              chat-template rendering + packing into fixed rows
+  data/extract_activations.py      optional on-disk activation cache for stage 1
+  training/train_stage1_feature.py stage 1 (teacher | chained)
+  training/train_stage2_distill.py stage 2 (KL T=2 + CE)
   benchmark/latency_eval.py        (todo)
   benchmark/profile_cuda.py        (todo)
-tests/test_forward_pass.py
+tests/                   test_forward_pass.py, test_training.py, test_engine.py
 ```
 
 ## Conventions
 
-- **Layer indices are 0-based.** Llama-3-8B has layers 0..31, so first/middle/last
-  is `[0, 15, 31]`. Llama-3-70B has layers 0..79, so it is `[0, 39, 79]`.
+- **Layer indices are 0-based.** Llama-3.2-1B has layers 0..15, Llama-3-8B has
+  0..31, and Llama-3-70B has 0..79.
 - **Boundary `i`** is the residual stream entering layer `i`, and **boundary `L`**
   is the stream entering the final norm. A bridge is placed wherever the
   draft skips layers. `draft.bridge_specs` lists each bridge's
@@ -60,26 +145,10 @@ tests/test_forward_pass.py
   and out. With `device_map="auto"`, each bridge is placed on the device of
   the layer that consumes its output.
 
-## Usage
-
-```python
-from ssd.config import SSDConfig
-from ssd.models import SubnetworkDraftModel
-
-cfg = SSDConfig.from_yaml("configs/llama3_8b_subnetwork.yaml")
-base, draft = SubnetworkDraftModel.from_config(cfg)
-
-cache = draft.new_cache(max_length=4096)
-out = draft(input_ids, past_key_values=cache)                  # prefill
-out = draft(tree_ids, position_ids=tree_pos, past_key_values=cache,
-            tree_attention_mask=tree_mask, logits_to_keep=0)   # tree step
-cache.keep_positions(start, accepted_positions)                # keep accepted path
-```
-
 ## Tests
 
 ```bash
 pip install -e ".[dev]"
-pytest                                   # tiny random Llama, CPU, ~2s
+pytest                                   # tiny random Llamas, CPU, ~30s
 SSD_TEST_LLAMA3_8B=1 pytest -m llama3_8b  # real Llama-3-8B-Instruct (gated HF repo)
 ```

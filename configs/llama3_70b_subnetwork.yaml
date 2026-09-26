@@ -1,35 +1,47 @@
 model:
   base_model: meta-llama/Meta-Llama-3-70B-Instruct
-  # 0-indexed. Llama-3-70B has 80 decoder layers (0..79), so the first/middle/last
-  # selection written 1-indexed as {1, 40, 80} is [0, 39, 79] here.
-  layer_indices: [0, 39, 79]
   torch_dtype: bfloat16
-  device_map: auto     # shard across GPUs; bridges follow their next layer
+  device_map: auto          # shard across GPUs; bridges follow the layer they feed
   attn_implementation: sdpa
 
+# 0-based base layers forming the draft sub-network, used for every draft step (Llama-3-70B has layers 0..79).
+draft_layers: [0, 39, 79]
+
 bridge:
-  mlp_type: mlp          # mlp | swiglu
-  num_layers: 2          # 2 or 3 for mlp
-  hidden_dim: null       # null -> d_model (8192); smaller = bottleneck, larger = expansion
+  mlp_type: mlp
+  num_layers: 2
+  hidden_dim: null          # null -> d_model (8192)
   activation: silu
   bias: true
-  init_std: 1.0e-3       # output projection std -> bridge starts ~identity
-  norm_eps: 1.0e-5
+  init_std: 1.0e-3
   dtype: float32
 
+data:
+  dataset: HuggingFaceH4/ultrachat_200k
+  split: train_sft
+  seq_len: 1024
+
 training:
+  output_dir: outputs/llama3_70b
   stage1:
+    steps: 4000
+    batch_size: 4
+    lr: 1.0e-4
     alpha_mse: 1.0
     beta_cos: 1.0
-    lr: 1.0e-4
-    seq_len: 1024
   stage2:
+    steps: 4000
+    batch_size: 2
+    lr: 3.0e-5
     temperature: 2.0
     kd_weight: 1.0
     ce_weight: 0.1
-    lr: 3.0e-5
 
 drafting:
-  max_depth: 6           # K
-  top_k_per_node: 4
-  total_tokens: 60       # tree budget per verification step
+  # Speculation tree (per-depth fields take an int or a list of length `depth`).
+  depth: 6               # K: tokens drafted ahead per round
+  branch: [4, 3, 2, 2, 1, 1]   # children proposed per kept node, per depth
+  width: 10               # nodes kept per depth (by cumulative draft prob); null = no cap
+  max_nodes: 60          # nodes sent to the target for verification; null = all
+  temperature: 0.0       # 0 = greedy (output identical to target greedy decoding)
+  top_p: 1.0

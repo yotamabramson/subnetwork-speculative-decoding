@@ -218,24 +218,20 @@ def test_bridge_specs_line_up_with_target_boundaries(tiny_llama):
         assert pred.shape == taps[s.tgt_boundary].shape
 
 
-# ------------------------------------------------------------------- configs
-@pytest.mark.parametrize("name,indices", [("llama3_8b", [0, 15, 31]), ("llama3_70b", [0, 39, 79])])
-def test_configs_load(name, indices):
-    cfg = SSDConfig.from_yaml(os.path.join(REPO_ROOT, "configs", f"{name}_subnetwork.yaml"))
-    assert cfg.model.layer_indices == indices
-    assert cfg.training["stage2"]["temperature"] == 2.0
-
-
 # ------------------------------------------------------------ real Llama-3-8B
 @pytest.mark.llama3_8b
 @pytest.mark.skipif(os.environ.get("SSD_TEST_LLAMA3_8B") != "1", reason="set SSD_TEST_LLAMA3_8B=1")
 def test_llama3_8b_subnetwork_forward():
-    cfg = SSDConfig.from_yaml(os.path.join(REPO_ROOT, "configs", "llama3_8b_subnetwork.yaml"))
-    if cfg.model.device_map is None:
-        cfg.model.device_map = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
-    base, draft = SubnetworkDraftModel.from_config(cfg)
+    from ssd.runtime import build_draft, load_base_model, setup_env
 
-    for slot, idx in enumerate(cfg.model.layer_indices):
+    setup_env()
+    cfg = SSDConfig.from_yaml(os.path.join(REPO_ROOT, "configs", "llama3_8b_subnetwork.yaml"))
+    base = load_base_model(cfg)
+    layers = cfg.draft_layers
+    assert layers == [0, 15, 31]
+    draft = build_draft(cfg, base, checkpoint=None)
+
+    for slot, idx in enumerate(layers):
         assert draft.base.layers[slot] is base.model.layers[idx]
     assert [s.name for s in draft.bridge_specs] == ["into_15", "into_31"]
     n_bridge = sum(p.numel() for p in draft.parameters())

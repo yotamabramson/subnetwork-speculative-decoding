@@ -22,6 +22,7 @@ our own KV cache, and independence from HF's cache/mask API churn.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -29,8 +30,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ssd.config import BridgeConfig, SSDConfig, validate_layer_indices
-from ssd.engine.kv_cache import DraftKVCache
+from ssd.config import BridgeConfig, validate_layer_indices
+from ssd.engine.kv_cache import KVCache
 from ssd.models.bridges import TransitionBridge
 
 
@@ -45,8 +46,27 @@ class BridgeSpec:
 class DraftOutput:
     logits: Optional[torch.Tensor]
     hidden_states: torch.Tensor  # final-norm output, [B, T, d]
-    past_key_values: Optional[DraftKVCache]
+    past_key_values: Optional[KVCache]
     bridge_states: dict[str, torch.Tensor] = field(default_factory=dict)  # bridge name -> output
+
+
+def plan_bridges(layer_indices: list[int], num_base_layers: int) -> list[BridgeSpec]:
+    """A bridge goes wherever the draft skips base layers: before each selected
+    layer that doesn't directly follow the previous one, and before the final
+    norm if the last base layer isn't selected."""
+    specs: list[BridgeSpec] = []
+    have = 0  # boundary produced so far (embeddings = boundary 0)
+    for idx in layer_indices:
+        if have != idx:
+            specs.append(BridgeSpec(f"into_{idx}", have, idx))
+        have = idx + 1
+    if have != num_base_layers:
+        specs.append(BridgeSpec("into_norm", have, num_base_layers))
+    return specs
+
+
+def required_boundaries(layer_indices: list[int], num_base_layers: int) -> set[int]:
+    return {b for s in plan_bridges(layer_indices, num_base_layers) for b in (s.src_boundary, s.tgt_boundary)}
 
 
 class _BaseRefs:
@@ -92,41 +112,16 @@ class SubnetworkDraftModel(nn.Module):
             base_model.requires_grad_(False)
         self.base = _BaseRefs(base_model, self.layer_indices)
 
-        # Bridge placement: slot k's bridge (if any) runs right before layer
-        # layer_indices[k]; "into_norm" runs before the final norm.
-        self.bridge_specs: list[BridgeSpec] = []
-        self._pre_layer_bridge: list[Optional[str]] = []
-        have = 0  # boundary produced so far (embeddings = boundary 0)
-        for idx in self.layer_indices:
-            name = None
-            if have != idx:
-                name = f"into_{idx}"
-                self.bridge_specs.append(BridgeSpec(name, have, idx))
-            self._pre_layer_bridge.append(name)
-            have = idx + 1
-        self._pre_norm_bridge = None
-        if have != self.num_base_layers:
-            self._pre_norm_bridge = "into_norm"
-            self.bridge_specs.append(BridgeSpec("into_norm", have, self.num_base_layers))
+        self.bridge_specs = plan_bridges(self.layer_indices, self.num_base_layers)
+        by_target = {s.tgt_boundary: s.name for s in self.bridge_specs}
+        # Bridge (if any) that runs right before each selected layer / the final norm.
+        self._pre_layer_bridge = [by_target.get(idx) for idx in self.layer_indices]
+        self._pre_norm_bridge = by_target.get(self.num_base_layers)
 
         self.bridges = nn.ModuleDict(
             {s.name: TransitionBridge.from_config(self.d_model, self.bridge_config) for s in self.bridge_specs}
         )
         self.place_bridges()
-
-    @classmethod
-    def from_config(cls, cfg: SSDConfig) -> tuple[nn.Module, "SubnetworkDraftModel"]:
-        """Load the target model named in ``cfg`` and build its draft. Returns (base, draft)."""
-        from transformers import AutoModelForCausalLM
-
-        base = AutoModelForCausalLM.from_pretrained(
-            cfg.model.base_model,
-            dtype=getattr(torch, cfg.model.torch_dtype),
-            device_map=cfg.model.device_map,
-            attn_implementation=cfg.model.attn_implementation,
-        )
-        base.eval()
-        return base, cls(base, cfg.model.layer_indices, cfg.bridge)
 
     def place_bridges(self) -> None:
         """Put each bridge on the device of the base module that consumes its output."""
@@ -142,8 +137,8 @@ class SubnetworkDraftModel(nn.Module):
     def num_layers(self) -> int:
         return len(self.layer_indices)
 
-    def new_cache(self, max_length: int) -> DraftKVCache:
-        return DraftKVCache(self.num_layers, max_length)
+    def new_cache(self, max_length: int) -> KVCache:
+        return KVCache(self.num_layers, max_length)
 
     @staticmethod
     def _build_attn_mask(
@@ -154,6 +149,11 @@ class SubnetworkDraftModel(nn.Module):
         device: torch.device,
     ) -> Optional[torch.Tensor]:
         """Boolean SDPA mask [B, 1, q, past+q] (True = attend), or None for pure causal."""
+        if tree_attention_mask is not None and tree_attention_mask.shape[-1] == past_len + q_len and past_len > 0:
+            mask = tree_attention_mask.to(device=device, dtype=torch.bool)
+            if mask.dim() == 2:
+                mask = mask.expand(bsz, q_len, past_len + q_len)
+            return mask.unsqueeze(1)
         if tree_attention_mask is None:
             if q_len == 1:
                 return None
@@ -175,7 +175,7 @@ class SubnetworkDraftModel(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         attn_mask: Optional[torch.Tensor],
-        cache: Optional[DraftKVCache],
+        cache: Optional[KVCache],
     ) -> torch.Tensor:
         layer = self.base.layers[slot]
         attn = layer.self_attn
@@ -214,7 +214,7 @@ class SubnetworkDraftModel(nn.Module):
         self,
         input_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
-        past_key_values: Optional[DraftKVCache] = None,
+        past_key_values: Optional[KVCache] = None,
         tree_attention_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         logits_to_keep: int = 0,
@@ -227,11 +227,12 @@ class SubnetworkDraftModel(nn.Module):
             input_ids: [B, q] new tokens (or pass ``inputs_embeds``).
             position_ids: [B, q] absolute positions. Defaults to
                 ``past_len + arange(q)``; tree drafting must pass depth-based positions.
-            past_key_values: a ``DraftKVCache`` (see ``new_cache``). Updated in place
+            past_key_values: a ``KVCache`` (see ``new_cache``). Updated in place
                 and advanced by ``q``.
-            tree_attention_mask: bool [q, q] or [B, q, q], True = query may attend to
-                key, among the ``q`` new tokens. All cached tokens are always visible.
-                None -> causal.
+            tree_attention_mask: bool, True = query may attend to key. Either
+                [.., q, q] over the new tokens only (every cached token visible), or
+                [.., q, past+q] over cache + new tokens (lets tree nodes see only
+                their own ancestors among earlier cached nodes). None -> causal.
             logits_to_keep: if > 0, only compute logits for the last N positions
                 (the 128k-vocab lm_head is a large share of draft cost).
             compute_logits: skip the lm_head entirely (e.g. Stage 1 feature losses).
@@ -286,12 +287,15 @@ class SubnetworkDraftModel(nn.Module):
         return DraftOutput(logits=logits, hidden_states=h, past_key_values=past_key_values, bridge_states=bridge_states)
 
     # ------------------------------------------------------------ persistence
-    def save_bridges(self, path: str) -> None:
+    def save_bridges(self, path: str, **meta) -> None:
+        """Save bridge weights plus ``meta`` (e.g. stage, step) to ``path``."""
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         torch.save(
             {
                 "layer_indices": self.layer_indices,
                 "bridge_config": vars(self.bridge_config),
                 "state_dict": self.bridges.state_dict(),
+                "meta": meta,
             },
             path,
         )

@@ -1,4 +1,5 @@
-"""Dedicated KV cache for the draft sub-network.
+"""Preallocated KV cache used by the draft sub-network and, during tree
+verification, by the target (run through the same layer implementation).
 
 One preallocated [B, n_kv_heads, max_len, head_dim] buffer pair per draft
 layer slot (slot = position in ``layer_indices``, not the base layer index).
@@ -17,7 +18,7 @@ from typing import Optional
 import torch
 
 
-class DraftKVCache:
+class KVCache:
     def __init__(self, num_slots: int, max_length: int):
         self.num_slots = num_slots
         self.max_length = max_length
@@ -32,7 +33,7 @@ class DraftKVCache:
         bsz, n_kv, q_len, head_dim = k.shape
         end = self.seq_len + q_len
         if end > self.max_length:
-            raise RuntimeError(f"DraftKVCache overflow: {end} > max_length={self.max_length}")
+            raise RuntimeError(f"KVCache overflow: {end} > max_length={self.max_length}")
         if self.k[slot] is None:
             shape = (bsz, n_kv, self.max_length, head_dim)
             self.k[slot] = torch.empty(shape, dtype=k.dtype, device=k.device)
