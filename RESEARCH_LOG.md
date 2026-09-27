@@ -314,3 +314,30 @@ briefly slowed training. The branch was kept, reviewed later, and merged at
 - **8B / A100 behavior:** the real speedup, and whether 3 layers is viable or
   5–7 are needed. Stage 1 bridge cosines on 8B are the cheapest first signal.
 - **Self-distillation on a 5-layer draft** (`[0,1,7,14,15]`), not yet run.
+
+## 2026-09-27 21:20: online run failed on memory, fixed and restarted
+
+- **What happened:** the first 12-hour online run (started 20:07) slowed about
+  15x after ~1 hour. From step 60 on, 20 steps took ~15 minutes instead of ~1.
+- **Cause:** the training process's footprint reached **19 GB on the 18 GB
+  Mac**, with ~17 GB of swap in use. Each slide re-prefilled 32 streams × 512
+  tokens at once. PyTorch's caching allocator on the Mac GPU keeps freed
+  blocks and may grow to ~1.7x the recommended limit before failing, so it
+  crept into swap instead of erroring.
+- **Also found:** an orphaned Python process from the 09:23 generation
+  benchmark had been alive all day. It was killed. It was idle and probably not
+  the cause.
+- **Fix** (commit `4f843cb`):
+  - `max_context` 2048 → 1024 and `keep_on_slide` 512 → 256.
+  - Drop the old cache and free device memory around each slide and after each
+    training pass.
+  - Log device memory (`mem_gb`) with every metric line.
+  - Training rows still get 384 tokens of context, so what the bridges see is
+    unchanged.
+- **Verification run** (120 steps): memory goes up and down between 10.2 and
+  12.6 GB instead of climbing steadily. Top-1 agreement on the stream reached
+  ~76–79% by steps 100–120.
+- **Restarted from scratch at 21:20:** 12 hours from the same warm start. The
+  queue then runs the standard evaluation (full vocabulary and 32k draft
+  vocabulary) and the in-domain bioluminescence evaluation, before and after
+  online training.
