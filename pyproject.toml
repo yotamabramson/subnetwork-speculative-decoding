@@ -9,7 +9,7 @@ description = "Subnetwork Speculative Decoding: draft with a frozen layer subset
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "torch>=2.3",
+    "torch>=2.5",
     "transformers>=4.56",
     "accelerate>=0.30",
     "datasets>=2.19",

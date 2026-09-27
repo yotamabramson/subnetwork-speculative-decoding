@@ -211,15 +211,12 @@ class SubnetworkDraftModel(nn.Module):
             idx = torch.arange(q_len, device=h.device)
             attn_mask = torch.cat([idx[None, :] < idx[:, None], torch.eye(q_len, dtype=torch.bool, device=h.device)], 1)
 
-        n_rep = self.num_heads // self.num_kv_heads
-        if n_rep > 1:
-            k = k.repeat_interleave(n_rep, dim=1)
-            v = v.repeat_interleave(n_rep, dim=1)
-
+        # GQA without materialising repeated K/V (which would copy the whole cache per call).
+        gqa = self.num_heads != self.num_kv_heads
         if attn_mask is None and q_len > 1:  # no cache, no tree: plain causal
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=gqa)
         else:
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=gqa)
         out = out.transpose(1, 2).reshape(bsz, q_len, self.num_heads * self.head_dim)
         h = residual + attn.o_proj(out)
 
