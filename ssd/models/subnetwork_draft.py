@@ -54,6 +54,7 @@ class DraftOutput:
     hidden_states: torch.Tensor  # final-norm output, [B, T, d]
     past_key_values: Optional[KVCache]
     bridge_states: dict[str, torch.Tensor] = field(default_factory=dict)  # bridge name -> output
+    vocab_ids: Optional[torch.Tensor] = None  # set when logits cover a vocab subset: column j is token vocab_ids[j]
 
 
 def plan_bridges(layer_indices: list[int], num_base_layers: int) -> list[BridgeSpec]:
@@ -128,6 +129,18 @@ class SubnetworkDraftModel(nn.Module):
             {s.name: TransitionBridge.from_config(self.d_model, self.bridge_config) for s in self.bridge_specs}
         )
         self.place_bridges()
+        self.vocab_ids: Optional[torch.Tensor] = None
+        self._sub_head: Optional[torch.Tensor] = None
+
+    def set_vocab_subset(self, token_ids: Optional[torch.Tensor]) -> None:
+        """Score only ``token_ids`` (e.g. the most frequent tokens) in the draft's
+        lm_head. Keeps a sliced copy of the lm_head rows (|subset| x d)."""
+        if token_ids is None:
+            self.vocab_ids = self._sub_head = None
+            return
+        w = self.base.lm_head.weight
+        self.vocab_ids = token_ids.to(w.device)
+        self._sub_head = w.detach().index_select(0, self.vocab_ids).contiguous()
 
     def place_bridges(self) -> None:
         """Put each bridge on the device of the base module that consumes its output."""
@@ -305,8 +318,15 @@ class SubnetworkDraftModel(nn.Module):
         logits = None
         if compute_logits:
             hs = h[:, -logits_to_keep:] if logits_to_keep > 0 else h
-            logits = self.base.lm_head(hs.to(_module_device(self.base.lm_head)))
-        return DraftOutput(logits=logits, hidden_states=h, past_key_values=past_key_values, bridge_states=bridge_states)
+            hs = hs.to(_module_device(self.base.lm_head))
+            logits = F.linear(hs, self._sub_head) if self._sub_head is not None else self.base.lm_head(hs)
+        return DraftOutput(
+            logits=logits,
+            hidden_states=h,
+            past_key_values=past_key_values,
+            bridge_states=bridge_states,
+            vocab_ids=self.vocab_ids if compute_logits else None,
+        )
 
     # ------------------------------------------------------------ persistence
     def save_bridges(self, path: str, **meta) -> None:

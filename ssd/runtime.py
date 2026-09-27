@@ -99,4 +99,14 @@ def build_draft(cfg: SSDConfig, base: nn.Module, checkpoint: Optional[str | Path
     if checkpoint is not None:
         draft.load_bridges(str(checkpoint))
         log.info("loaded bridges for %s from %s", name, checkpoint)
+    if cfg.drafting.draft_vocab:
+        from ssd.data.token_freq import token_freq_path, top_vocab
+
+        path = token_freq_path(cfg)
+        if not path.exists():
+            raise FileNotFoundError(f"{path} missing: run ssd-train or `python -m ssd.data.token_freq --config ...`")
+        eos = base.generation_config.eos_token_id
+        eos = set(eos if isinstance(eos, list) else [eos])
+        draft.set_vocab_subset(top_vocab(torch.load(path), cfg.drafting.draft_vocab, eos))
+        log.info("draft vocab: %d most frequent tokens", cfg.drafting.draft_vocab)
     return draft

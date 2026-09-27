@@ -53,3 +53,4 @@ drafting:
   max_nodes: 24          # nodes sent to the target for verification; null = all
   temperature: 0.0       # 0 = greedy (output identical to target greedy decoding)
   top_p: 1.0
+  draft_vocab: null       # draft scores only the N most frequent tokens (e.g. 32768); null = full

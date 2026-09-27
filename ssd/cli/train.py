@@ -15,6 +15,7 @@ import logging
 import os
 
 from ssd.config import SSDConfig, profile_name
+from ssd.data.token_freq import ensure_token_freq
 from ssd.runtime import free_device_memory, load_base_model, load_tokenizer, setup_env
 from ssd.training.train_stage1_feature import train_stage1
 from ssd.training.train_stage2_distill import train_stage2
@@ -52,6 +53,8 @@ def main(argv=None):
     base = load_base_model(cfg, accelerator.device if accelerator else None)
     tokenizer = load_tokenizer(cfg)
     log.info("draft layers %s", profile_name(cfg.draft_layers))
+    if accelerator is None or accelerator.is_main_process:
+        ensure_token_freq(cfg, tokenizer)  # for drafting.draft_vocab
 
     if args.stage in ("1", "all"):
         train_stage1(cfg, base, tokenizer, max_steps=args.steps, accelerator=accelerator)

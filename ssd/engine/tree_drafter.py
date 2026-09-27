@@ -122,12 +122,21 @@ class TreeDrafter:
         return min(total, self.cfg.max_nodes) if self.cfg.max_nodes else total
 
     def _propose(self, logits: torch.Tensor, k: int, generator: Optional[torch.Generator]):
-        """logits [n, V] for n parents -> per parent (tokens, log-probs, warped q or None)."""
+        """logits [n, V'] for n parents -> per parent (tokens, log-probs, warped q or None).
+        With a draft vocab subset, V' < V and columns map through ``draft.vocab_ids``;
+        q is scattered back to the full vocab (zero outside the subset)."""
+        vocab_ids = self.draft.vocab_ids
         if self.greedy:
             lp, tok = F.log_softmax(logits.float(), -1).topk(k, dim=-1)
+            if vocab_ids is not None:
+                tok = vocab_ids[tok]
             return [(t, l, None) for t, l in zip(tok.tolist(), lp.tolist())]
+        probs = warp_probs(logits, self.cfg.temperature, self.cfg.top_p)
+        if vocab_ids is not None:
+            full = torch.zeros(probs.shape[0], self.draft.base.lm_head.weight.shape[0], device=probs.device)
+            probs = full.index_copy_(1, vocab_ids.to(probs.device), probs)
         out = []
-        for q in warp_probs(logits, self.cfg.temperature, self.cfg.top_p).cpu():
+        for q in probs.cpu():
             support = int((q > 0).sum())
             gumbel = -torch.empty_like(q).exponential_(generator=generator).log()
             keys = q.log() + gumbel  # -inf outside the support
