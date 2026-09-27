@@ -118,6 +118,18 @@ uses the same path, so speedups compare like with like.
 - **Stage 2 (distillation).** The full draft runs on real text, trained with
   KL divergence (T=2) against the target's logits plus next-token CE. Logs
   include `top1_agree`, which is the depth-1 greedy acceptance rate.
+- **Online self-distillation** (`ssd-train --stage online [--hours H] [--init ckpt]`):
+  the target samples endless parallel streams from one fixed prompt
+  (`training.online`). It keeps going past end-of-turn, and slides when a
+  stream reaches `max_context`. While generating, it records its inputs to the
+  draft's layers and its final hidden states, so there is no second target pass
+  and no stored dataset. Every `chunk` tokens, the bridges train on the new
+  positions, with preceding positions supplying the target's keys/values as
+  context. Checkpoints go to `{output_dir}/{profile}/online.pt`, which
+  `ssd-run` prefers over stage 2 and stage 1 checkpoints.
+- **Self-distillation dataset** (`python -m ssd.data.generate_selfdistill`): the
+  stored alternative. The target answers dataset prompts, and training reads
+  the resulting `.jsonl` through `data.local_path`.
 - **Multi-GPU:** `accelerate launch -m ssd.cli.train --config ...` (DDP). For
   70B, use `model.device_map: auto` in a single process instead.
 

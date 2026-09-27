@@ -75,21 +75,30 @@ def input_device(base: nn.Module) -> torch.device:
     return base.model.embed_tokens.weight.device
 
 
-def checkpoint_path(cfg: SSDConfig, stage: int) -> Path:
-    return Path(cfg.training.output_dir) / profile_name(cfg.draft_layers) / f"stage{stage}.pt"
+def checkpoint_path(cfg: SSDConfig, stage: int | str) -> Path:
+    """stage: 1, 2 or "online"."""
+    name = f"stage{stage}.pt" if isinstance(stage, int) else f"{stage}.pt"
+    return Path(cfg.training.output_dir) / profile_name(cfg.draft_layers) / name
 
 
 def latest_checkpoint(cfg: SSDConfig) -> Optional[Path]:
-    for stage in (2, 1):
+    for stage in ("online", 2, 1):
         p = checkpoint_path(cfg, stage)
         if p.exists():
             return p
     return None
 
 
-def build_draft(cfg: SSDConfig, base: nn.Module, checkpoint: Optional[str | Path] = "latest") -> SubnetworkDraftModel:
+def build_draft(
+    cfg: SSDConfig,
+    base: nn.Module,
+    checkpoint: Optional[str | Path] = "latest",
+    inference: bool = False,
+) -> SubnetworkDraftModel:
     """Build the draft for ``cfg.draft_layers``. ``checkpoint``: a path, "latest"
-    (stage2 > stage1 under output_dir, else untrained with a warning), or None."""
+    (online > stage2 > stage1 under output_dir, else untrained with a warning), or None.
+    ``inference``: cast bridges to the base dtype (they train in fp32) and apply
+    ``drafting.draft_vocab``."""
     draft = SubnetworkDraftModel(base, cfg.draft_layers, cfg.bridge)
     name = profile_name(cfg.draft_layers)
     if checkpoint == "latest":
@@ -99,7 +108,9 @@ def build_draft(cfg: SSDConfig, base: nn.Module, checkpoint: Optional[str | Path
     if checkpoint is not None:
         draft.load_bridges(str(checkpoint))
         log.info("loaded bridges for %s from %s", name, checkpoint)
-    if cfg.drafting.draft_vocab:
+    if inference:
+        draft.bridges.to(base.model.embed_tokens.weight.dtype)
+    if inference and cfg.drafting.draft_vocab:
         from ssd.data.token_freq import token_freq_path, top_vocab
 
         path = token_freq_path(cfg)

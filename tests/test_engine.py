@@ -115,6 +115,23 @@ def test_training_mode_matches_shared_cache_inference(base, layers):
         assert not torch.allclose(train_logits, draft(ids).logits, atol=1e-3)
 
 
+def test_training_mode_with_context_prefix(base):
+    """Running the draft only on the last q positions, with target inputs over the
+    whole window as context, equals the full-window run at those positions."""
+    from ssd.models.target_wrapper import TargetWrapper
+
+    layers = [0, 3, 5]
+    draft = SubnetworkDraftModel(base, layers, BridgeConfig(init_std=0.05))
+    ids = torch.randint(0, 128, (2, 20), generator=torch.Generator().manual_seed(4))
+    with torch.no_grad():
+        taps = TargetWrapper(base)(ids, boundaries=layers, compute_logits=False).boundaries
+        full = draft(ids, true_layer_inputs=taps).logits
+        q = 6
+        pos = torch.arange(20 - q, 20).unsqueeze(0).expand(2, -1)
+        tail = draft(ids[:, -q:], position_ids=pos, true_layer_inputs=taps).logits
+    torch.testing.assert_close(tail, full[:, -q:], atol=1e-4, rtol=1e-4)
+
+
 def test_tree_shape_limits(base):
     draft = SubnetworkDraftModel(base, [0, 3, 5])
     cfg = TREES["pruned"]

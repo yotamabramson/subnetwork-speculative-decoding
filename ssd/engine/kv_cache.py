@@ -58,6 +58,9 @@ class KVCache:
         the accepted tree path) and moves them to ``[start, start + len)``.
         """
         n = positions.numel()
+        if n == 0 or torch.equal(positions.cpu(), torch.arange(start, start + n)):
+            self.seq_len = start + n  # already in place (e.g. an accepted chain): nothing to move
+            return
         for slot in range(self.num_slots):
             if self.k[slot] is None:
                 continue

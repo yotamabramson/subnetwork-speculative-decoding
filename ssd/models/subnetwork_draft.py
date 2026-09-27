@@ -55,6 +55,7 @@ class DraftOutput:
     past_key_values: Optional[KVCache]
     bridge_states: dict[str, torch.Tensor] = field(default_factory=dict)  # bridge name -> output
     vocab_ids: Optional[torch.Tensor] = None  # set when logits cover a vocab subset: column j is token vocab_ids[j]
+    layer_inputs: dict[int, torch.Tensor] = field(default_factory=dict)  # base layer -> its input (after any bridge)
 
 
 def plan_bridges(layer_indices: list[int], num_base_layers: int) -> list[BridgeSpec]:
@@ -198,15 +199,17 @@ class SubnetworkDraftModel(nn.Module):
         attn_mask: Optional[torch.Tensor],
         cache: Optional[KVCache],
         true_input: Optional[torch.Tensor] = None,
+        true_rope: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         layer = self.base.layers[slot]
         attn = layer.self_attn
         bsz, q_len, _ = h.shape
         cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
 
-        def kv(x):
-            k = attn.k_proj(x).view(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-            v = attn.v_proj(x).view(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        def kv(x, cos=cos, sin=sin):
+            n = x.shape[1]
+            k = attn.k_proj(x).view(bsz, n, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            v = attn.v_proj(x).view(bsz, n, self.num_kv_heads, self.head_dim).transpose(1, 2)
             return k * cos + _rotate_half(k) * sin, v
 
         residual = h
@@ -218,11 +221,17 @@ class SubnetworkDraftModel(nn.Module):
         if cache is not None:
             k, v = cache.update(self.layer_indices[slot], k, v)
         elif true_input is not None:
-            # Keys: target's KV for positions < t, then the draft's own KV at t.
-            k_t, v_t = kv(layer.input_layernorm(true_input.to(h.device, h.dtype)))
+            # Keys: target's KV for positions < t, then the draft's own KV at t. The
+            # target inputs may cover a longer window than the queries (context-only
+            # prefix): queries are its last q_len positions.
+            t_len = true_input.shape[1]
+            t_cos, t_sin = (c.unsqueeze(1) for c in true_rope) if true_rope is not None else (cos, sin)
+            k_t, v_t = kv(layer.input_layernorm(true_input.to(h.device, h.dtype)), t_cos, t_sin)
             k, v = torch.cat([k_t, k], dim=2), torch.cat([v_t, v], dim=2)
-            idx = torch.arange(q_len, device=h.device)
-            attn_mask = torch.cat([idx[None, :] < idx[:, None], torch.eye(q_len, dtype=torch.bool, device=h.device)], 1)
+            q_abs = torch.arange(t_len - q_len, t_len, device=h.device)
+            attn_mask = torch.cat(
+                [torch.arange(t_len, device=h.device)[None, :] < q_abs[:, None],
+                 torch.eye(q_len, dtype=torch.bool, device=h.device)], 1)
 
         # GQA without materialising repeated K/V (which would copy the whole cache per call).
         gqa = self.num_heads != self.num_kv_heads
@@ -248,6 +257,7 @@ class SubnetworkDraftModel(nn.Module):
         compute_logits: bool = True,
         output_bridge_states: bool = False,
         true_layer_inputs: Optional[dict[int, torch.Tensor]] = None,
+        output_layer_inputs: Optional[set[int]] = None,
     ) -> DraftOutput:
         """Run the draft sub-network.
 
@@ -269,6 +279,11 @@ class SubnetworkDraftModel(nn.Module):
                 the target's own input to each selected layer (``TargetWrapper``
                 boundary taps). Position t then attends to keys/values computed from
                 these for positions < t, exactly as at inference with a shared cache.
+                T may exceed the number of new tokens: the extra leading positions are
+                context only (keys/values, no draft computation or outputs).
+            output_layer_inputs: base layer indices whose input hidden state to return
+                in ``layer_inputs`` (with all layers selected, these are the target's
+                own boundary activations, i.e. what ``true_layer_inputs`` expects).
         """
         if true_layer_inputs is not None and past_key_values is not None:
             raise ValueError("true_layer_inputs is for training without a cache")
@@ -281,6 +296,14 @@ class SubnetworkDraftModel(nn.Module):
         if position_ids is None:
             position_ids = torch.arange(past_len, past_len + q_len, device=h.device).unsqueeze(0).expand(bsz, -1)
         cos, sin = self.base.rotary_emb(h, position_ids)
+        true_cos = true_sin = None
+        if true_layer_inputs:
+            t_len = next(iter(true_layer_inputs.values())).shape[1]
+            if t_len < q_len:
+                raise ValueError("true_layer_inputs must cover at least the query positions")
+            if t_len > q_len:  # context-only prefix: rope for its key positions too
+                t_pos = position_ids[:, :1] - (t_len - q_len) + torch.arange(t_len, device=h.device)
+                true_cos, true_sin = self.base.rotary_emb(h, t_pos)
 
         if past_key_values is None and tree_attention_mask is None:
             attn_mask = None  # SDPA is_causal fast path
@@ -288,6 +311,7 @@ class SubnetworkDraftModel(nn.Module):
             attn_mask = self._build_attn_mask(bsz, q_len, past_len, tree_attention_mask, h.device)
 
         bridge_states: dict[str, torch.Tensor] = {}
+        layer_inputs: dict[int, torch.Tensor] = {}
         for slot, layer in enumerate(self.base.layers):
             name = self._pre_layer_bridge[slot]
             if name is not None:
@@ -296,6 +320,8 @@ class SubnetworkDraftModel(nn.Module):
                     bridge_states[name] = h
             dev = _module_device(layer)
             h = h.to(dev)
+            if output_layer_inputs and self.layer_indices[slot] in output_layer_inputs:
+                layer_inputs[self.layer_indices[slot]] = h
             h = self._layer_forward(
                 slot,
                 h,
@@ -304,6 +330,7 @@ class SubnetworkDraftModel(nn.Module):
                 attn_mask.to(dev) if attn_mask is not None else None,
                 past_key_values,
                 true_layer_inputs[self.layer_indices[slot]] if true_layer_inputs is not None else None,
+                (true_cos.to(dev), true_sin.to(dev)) if true_cos is not None else None,
             )
 
         if self._pre_norm_bridge is not None:
@@ -326,6 +353,7 @@ class SubnetworkDraftModel(nn.Module):
             past_key_values=past_key_values,
             bridge_states=bridge_states,
             vocab_ids=self.vocab_ids if compute_logits else None,
+            layer_inputs=layer_inputs,
         )
 
     # ------------------------------------------------------------ persistence

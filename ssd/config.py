@@ -124,6 +124,31 @@ class DraftingConfig:
 
 
 @dataclass
+class OnlineConfig:
+    """Online self-distillation (``ssd-train --stage online``): the target generates
+    an endless stream from one fixed prompt and the bridges train on it as it is
+    produced. Nothing is stored."""
+
+    prompt: str = "Tell me about something you find fascinating, in detail."
+    streams: int = 32  # parallel sampled streams (all from the same prompt)
+    temperature: float = 0.8
+    top_p: float = 0.95  # applied within the top 64 tokens
+    chunk: int = 128  # tokens generated per stream between training passes (= loss positions)
+    context: int = 384  # extra preceding positions per training row (keys only, no loss)
+    max_context: int = 2048  # stream length that triggers a slide
+    keep_on_slide: int = 512  # tokens kept (re-prefilled at position 0) when sliding
+    micro_batch: int = 8  # stream rows per optimizer step
+    lr: float = 5e-5
+    weight_decay: float = 0.0
+    warmup_steps: int = 50
+    grad_clip: float = 1.0
+    temperature_kd: float = 2.0
+    kd_weight: float = 1.0
+    ce_weight: float = 0.1
+    save_every: int = 200  # optimizer steps
+
+
+@dataclass
 class TrainingConfig:
     output_dir: str = "outputs/default"
     seed: int = 0
@@ -131,6 +156,7 @@ class TrainingConfig:
     save_every: int = 500
     stage1: Stage1Config = field(default_factory=Stage1Config)
     stage2: Stage2Config = field(default_factory=Stage2Config)
+    online: OnlineConfig = field(default_factory=OnlineConfig)
 
 
 def _build(cls, raw: Optional[dict], where: str):
@@ -169,9 +195,10 @@ class SSDConfig:
         training = _build(
             TrainingConfig,
             {
-                **{k: v for k, v in tr.items() if k not in ("stage1", "stage2")},
+                **{k: v for k, v in tr.items() if k not in ("stage1", "stage2", "online")},
                 "stage1": _build(Stage1Config, tr.get("stage1"), "training.stage1"),
                 "stage2": _build(Stage2Config, tr.get("stage2"), "training.stage2"),
+                "online": _build(OnlineConfig, tr.get("online"), "training.online"),
             },
             "training",
         )

@@ -6,6 +6,7 @@ import logging
 import math
 import time
 from collections import defaultdict
+from typing import Optional
 
 import torch
 
@@ -32,16 +33,17 @@ class MetricLogger:
         self.tokens = 0
         self.t0 = time.perf_counter()
 
-    def update(self, step: int, total: int, stats: dict[str, float], tokens: int, lr: float) -> None:
+    def update(self, step: int, total: Optional[int], stats: dict[str, float], tokens: int, lr: float) -> None:
         for k, v in stats.items():
             self.sums[k] += v
         self.n += 1
         self.tokens += tokens
-        if (step + 1) % self.every == 0 or step + 1 == total:
+        if (step + 1) % self.every == 0 or (total is not None and step + 1 == total):
             dt = time.perf_counter() - self.t0
             if self.is_main:
                 body = " ".join(f"{k}={v / self.n:.4f}" for k, v in self.sums.items())
-                log.info("%s step %d/%d %s lr=%.2e tok/s=%.0f", self.prefix, step + 1, total, body, lr, self.tokens / dt)
+                of = f"/{total}" if total is not None else ""
+                log.info("%s step %d%s %s lr=%.2e tok/s=%.0f", self.prefix, step + 1, of, body, lr, self.tokens / dt)
             self.sums.clear()
             self.n = self.tokens = 0
             self.t0 = time.perf_counter()

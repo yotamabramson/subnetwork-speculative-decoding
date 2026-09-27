@@ -2,6 +2,7 @@
 
     ssd-train --config configs/llama32_1b_subnetwork.yaml                 # stage 1 then stage 2
     ssd-train --config ... --stage 1                                      # one stage only
+    ssd-train --config ... --stage online --hours 10 --init <ckpt>        # online self-distillation
     ssd-train --config ... --steps 20 --data-file notes.txt               # quick smoke run
     accelerate launch -m ssd.cli.train --config ...                       # multi-GPU (DDP)
 
@@ -26,7 +27,9 @@ log = logging.getLogger("ssd")
 def main(argv=None):
     p = argparse.ArgumentParser(prog="ssd-train", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--config", required=True)
-    p.add_argument("--stage", choices=["1", "2", "all"], default="all")
+    p.add_argument("--stage", choices=["1", "2", "all", "online"], default="all")
+    p.add_argument("--hours", type=float, help="online: stop after this many hours (default: until interrupted)")
+    p.add_argument("--init", help="online: bridge checkpoint to warm-start from")
     p.add_argument("--steps", type=int, help="override steps for every stage (smoke tests)")
     p.add_argument("--output-dir", help="override training.output_dir")
     p.add_argument("--data-file", help="override data.local_path (.jsonl with messages/text, or .txt)")
@@ -56,6 +59,11 @@ def main(argv=None):
     if accelerator is None or accelerator.is_main_process:
         ensure_token_freq(cfg, tokenizer)  # for drafting.draft_vocab
 
+    if args.stage == "online":
+        from ssd.training.train_online import train_online
+
+        train_online(cfg, base, tokenizer, init_from=args.init, hours=args.hours, max_steps=args.steps, seed=cfg.training.seed)
+        return
     if args.stage in ("1", "all"):
         train_stage1(cfg, base, tokenizer, max_steps=args.steps, accelerator=accelerator)
         free_device_memory()

@@ -48,6 +48,18 @@ def iter_prompts(cfg: SSDConfig, tokenizer, max_prompt_tokens: int) -> Iterator[
             yield msgs[0]["content"], ids
 
 
+def sample_next(logits: torch.Tensor, temperature: float, top_p: float, generator: Optional[torch.Generator] = None) -> torch.Tensor:
+    """[B, V] logits -> [B, 1] tokens. Greedy at temperature 0; otherwise top-k=64,
+    then temperature + top-p within those (a full-vocab nucleus sort over 128k
+    tokens is needlessly expensive)."""
+    if temperature == 0:
+        return logits.argmax(-1, keepdim=True)
+    val, idx = logits.float().topk(64, dim=-1)
+    probs = warp_probs(val, temperature, top_p)
+    choice = torch.multinomial(probs.cpu() if generator is not None else probs, 1, generator=generator)
+    return idx.gather(-1, choice.to(logits.device))
+
+
 @torch.no_grad()
 def generate_batch(
     target: TargetRunner,
@@ -80,15 +92,7 @@ def generate_batch(
     done = torch.zeros(B, dtype=torch.bool, device=dev)
     eos = torch.tensor(sorted(eos_ids), device=dev)
     for step in range(max_new_tokens):
-        if temperature == 0:
-            tok = logits.argmax(-1, keepdim=True)
-        else:
-            # top-k=64 then top-p within it: a full-vocab (128k) nucleus sort costs
-            # more than the forward pass on MPS.
-            val, idx = logits.float().topk(64, dim=-1)
-            probs = warp_probs(val, temperature, top_p)
-            choice = torch.multinomial(probs.cpu() if generator is not None else probs, 1, generator=generator)
-            tok = idx.gather(-1, choice.to(dev))
+        tok = sample_next(logits, temperature, top_p, generator)
         out = torch.cat([out, tok], 1)
         done |= torch.isin(tok[:, 0], eos)
         if bool(done.all()) or step == max_new_tokens - 1:

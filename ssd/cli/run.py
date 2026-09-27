@@ -86,7 +86,7 @@ def main(argv=None):
     target = TargetRunner(base)
     draft = None
     if args.mode == "sd":
-        draft = build_draft(cfg, base, None if args.untrained else (args.bridges or "latest"))
+        draft = build_draft(cfg, base, None if args.untrained else (args.bridges or "latest"), inference=True)
 
     print(f"\nprompt: {ids.shape[1]} tokens | device: {dev} | draft layers {profile_name(cfg.draft_layers)} ({len(cfg.draft_layers)}/{L})")
     print(f"tree: depth={dcfg.depth} branch={dcfg.branch} width={dcfg.width} max_nodes={dcfg.max_nodes} "
