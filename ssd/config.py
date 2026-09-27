@@ -137,6 +137,8 @@ class OnlineConfig:
     context: int = 384  # extra preceding positions per training row (keys only, no loss)
     max_context: int = 1024  # stream length that triggers a slide
     keep_on_slide: int = 256  # tokens kept (re-prefilled at position 0) when sliding
+    loop_window: int = 64  # loop detector: look at a stream's last N tokens...
+    loop_min_distinct: float = 0.25  # ...and re-prompt it if fewer than this fraction are distinct
     micro_batch: int = 8  # stream rows per optimizer step
     lr: float = 5e-5
     weight_decay: float = 0.0

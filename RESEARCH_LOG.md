@@ -341,3 +341,45 @@ briefly slowed training. The branch was kept, reviewed later, and merged at
   queue then runs the standard evaluation (full vocabulary and 32k draft
   vocabulary) and the in-domain bioluminescence evaluation, before and after
   online training.
+
+## 2026-09-27 22:45: online run #2 degenerated into a loop, fixed and restarted
+
+- **What happened:** the 21:20 restart ran with stable memory (~12 GB), but by
+  22:19 its top-1 agreement read **99%**. That's implausible for a 3-layer
+  draft.
+- **Diagnosis:** the streams had collapsed into an endless loop of role-header
+  tokens (`<|start_header_id|>assistant<|end_header_id|>…`). Stream 0 was
+  already looping at 21:30. The distinct-token ratio of a chunk, over all
+  streams pooled, fell 0.24 → 0.04 over the first ~1,000 steps. The draft was
+  learning to predict the loop, so the run was stopped and its checkpoint set
+  aside (`online_degenerate_2130.pt`, unused).
+- **Hypothesis 1, refuted:** that trimming a stream (the slide) broke it by
+  dropping the `<|begin_of_text|>` attention sink. A direct test (a
+  1,000-token stream slid with and without the prompt kept at the front)
+  stayed coherent both ways.
+- **Actual cause:** free-running past end-of-turn. The 1B occasionally falls
+  into the header loop, which it never leaves. With 32 streams over hours, all
+  of them eventually fall in. The earlier 1,500-token × 4-stream check was too
+  short and too small to catch it.
+- **Fix** (kept within the user's design: one fixed prompt, endless):
+  - At end of turn, the same prompt is re-inserted as a new user turn, and the
+    target answers again in the same conversation.
+  - A loop detector re-prompts any stream whose last 64 tokens are less than
+    25% distinct.
+  - Inserted tokens aren't target samples, so there's no loss on predicting
+    them.
+  - The distinct metric is now per stream (not pooled), so its values aren't
+    comparable to the 0.24 above.
+- **Validation** (400 steps, ~20 minutes):
+  - distinct stays 0.64–0.68 throughout;
+  - ~516 end-of-turn re-prompts; the loop detector essentially never fired;
+  - 2.5% of positions masked;
+  - top-1 agreement on the stream 53% → 65%, a realistic curve;
+  - memory 10.4–11.9 GB;
+  - the text is coherent, and topics now drift (bioluminescent bays, tides).
+- **Thermal:** the user worried about the Mac's temperature. macOS recorded no
+  thermal or performance warning at any check. Apple Silicon throttles itself
+  before damage; the main long-run cost is battery wear from heat at 100%
+  charge.
+- **Restarted:** 12 hours from the same warm start, followed by the same
+  evaluations.
