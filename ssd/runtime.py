@@ -51,6 +51,15 @@ def free_device_memory() -> None:
         torch.mps.empty_cache()
 
 
+def device_memory_gb(device: torch.device) -> float:
+    """Memory the framework holds on the device (incl. its allocator cache), in GB."""
+    if device.type == "cuda":
+        return torch.cuda.memory_reserved(device) / 2**30
+    if device.type == "mps":
+        return torch.mps.driver_allocated_memory() / 2**30
+    return 0.0
+
+
 def load_tokenizer(cfg: SSDConfig):
     from transformers import AutoTokenizer
 

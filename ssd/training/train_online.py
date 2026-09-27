@@ -31,7 +31,7 @@ from ssd.config import SSDConfig, profile_name
 from ssd.data.generate_selfdistill import sample_next
 from ssd.engine.speculative import TargetRunner, _sync
 from ssd.models.subnetwork_draft import SubnetworkDraftModel
-from ssd.runtime import checkpoint_path, input_device
+from ssd.runtime import checkpoint_path, device_memory_gb, free_device_memory, input_device
 from ssd.training.common import MetricLogger
 from ssd.training.losses import chunked_distill_loss
 
@@ -120,7 +120,10 @@ def train_online(
             for _ in range(oc.chunk):
                 if streams.len >= oc.max_context:  # slide: keep the tail, re-prefill at position 0
                     tail = streams.tokens[:, streams.len - oc.keep_on_slide : streams.len].clone()
+                    cache = None  # drop the old cache before allocating the new one
+                    free_device_memory()
                     cache, _ = prefill(tail)
+                    free_device_memory()  # the prefill's large temporaries would otherwise stay cached
                     trained_upto = streams.len
                 out = target(pending, past_key_values=cache, output_layer_inputs=want)
                 streams.write(pending, out)
@@ -159,7 +162,7 @@ def train_online(
             opt.step()
             sched.step()
             stats = {"loss": loss.item(), **stats, "distinct": distinct,
-                     "gen_tok_s": gen_tokens / max(gen_time, 1e-6)}
+                     "gen_tok_s": gen_tokens / max(gen_time, 1e-6), "mem_gb": device_memory_gb(dev)}
             metrics.update(step, total, stats, ids.numel(), sched.get_last_lr()[0])
             step += 1
             if step % oc.save_every == 0:
@@ -170,6 +173,7 @@ def train_online(
             if not running():
                 break
         trained_upto = L
+        free_device_memory()  # row shapes vary pass to pass; don't let the allocator cache pile up
 
     draft.save_bridges(str(out_path), stage="online", step=step, tokens=gen_tokens)
     log.info("[online %s] stopped after %d steps, %d generated tokens; saved %s", name, step, gen_tokens, out_path)

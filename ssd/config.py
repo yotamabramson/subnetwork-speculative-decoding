@@ -135,8 +135,8 @@ class OnlineConfig:
     top_p: float = 0.95  # applied within the top 64 tokens
     chunk: int = 128  # tokens generated per stream between training passes (= loss positions)
     context: int = 384  # extra preceding positions per training row (keys only, no loss)
-    max_context: int = 2048  # stream length that triggers a slide
-    keep_on_slide: int = 512  # tokens kept (re-prefilled at position 0) when sliding
+    max_context: int = 1024  # stream length that triggers a slide
+    keep_on_slide: int = 256  # tokens kept (re-prefilled at position 0) when sliding
     micro_batch: int = 8  # stream rows per optimizer step
     lr: float = 5e-5
     weight_decay: float = 0.0
