@@ -20,6 +20,9 @@ Training has two stages:
 2. **Logit distillation.** The draft is trained end to end with KL divergence
    at temperature T=2 against the target, plus ground-truth cross-entropy.
 
+The full history of the research (decisions, reversals, results) is in
+[RESEARCH_LOG.md](RESEARCH_LOG.md), an append-only log.
+
 ## Quick start (Mac / MPS, Llama-3.2-1B)
 
 ```bash
