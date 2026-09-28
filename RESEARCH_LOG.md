@@ -504,3 +504,31 @@ never drafted.
    a handicap of roughly 25%, not a decisive one. **Decisions:** τ and speedup
    are both optimized and both headline (the user rejected making τ primary);
    CUDA graphs are added for the draft path.
+
+## 2026-09-28: multi-step training ("training-time test") implemented; study launched
+
+- **Implementation:** `SubnetworkDraftModel.forward_unrolled` plus Stage 2
+  `ttt_steps`. At unrolled step j, position t plays the j-th token of a draft
+  chain started at t−j+1. It attends to the target's true KV before the chain,
+  the draft's own KV from steps 1..j−1, and itself. There's a loss at every
+  step.
+- **Tests:** step j equals real chained inference on the shared cache (the
+  target prefills the prefix, then the draft processes tokens one by one), for
+  several chain starts and two layer sets. Step 1 equals the old training mode.
+- **Cost on the Mac:** 565 tok/s single-step vs 175 tok/s at k=4.
+- **Warm-start baseline:** the self-distillation checkpoint's training-mode
+  top-1 agreement drops with depth: 58% (step 1), 53%, 51%, 50% (step 4).
+  That's the gap this study is meant to close.
+- **The study** (all runs start from that checkpoint, on the same data, lr and
+  seed), evaluated on 10 prompts (the old 5 plus 5 new) × 4 trees (chain
+  depths 4 and 8, default, wide):
+
+| Run | Stage 2 steps | Unrolled steps k |
+|---|---|---|
+| control | 1000 | 1 |
+| k=4 | 1000 | 4 |
+| k=2 | 1000 | 2 |
+| k=6 | 1000 | 6 |
+| control-long | 3200 | 1 (same wall-clock as k=4) |
+
+  Expected total: ~18 h.
