@@ -148,6 +148,29 @@ def test_stage2_improves_agreement(tiny_setup):
     assert kd(build_draft(cfg, base)) < before  # "latest" now resolves to stage2
 
 
+def test_stage2_multistep_training_runs_and_improves_deep_steps(tiny_setup):
+    """ttt_steps=3 trains all unrolled steps; step-2/3 KD should drop too."""
+    cfg, base = tiny_setup
+    cfg.training.stage2.ce_weight = 0.0
+    cfg.training.stage2.ttt_steps = 3
+    cfg.training.stage2.micro_batch = 2
+    from ssd.models.target_wrapper import TargetWrapper
+
+    ids = torch.tensor([[ord(c) % 128 for c in "sample 3: the quick brown fox jumps over the lazy dog."]])
+    layers = cfg.draft_layers
+
+    def deep_kd(d):
+        with torch.no_grad():
+            taps = TargetWrapper(base)(ids, boundaries=[*layers, 6], compute_logits=False).boundaries
+            outs = d.forward_unrolled(ids, {i: taps[i] for i in layers}, 3)
+            tgt = base.lm_head(base.model.norm(taps[6]))
+            return distill_loss(base.lm_head(outs[2])[:, 2:], tgt[:, 2:], None, ce_weight=0.0)[1]["kd"]
+
+    before = deep_kd(build_draft(cfg, base, checkpoint=None))
+    path = train_stage2(cfg, base, CharTokenizer(), init_from=None, max_steps=30)
+    assert deep_kd(build_draft(cfg, base, checkpoint=path)) < before
+
+
 def test_activation_cache_roundtrip_and_stage1_from_cache(tiny_setup, tmp_path):
     cfg, base = tiny_setup
     meta = extract(cfg, base, CharTokenizer(), str(tmp_path / "acts"), num_rows=12, rows_per_shard=8)

@@ -73,6 +73,11 @@ class Stage2Config:
     temperature: float = 2.0
     kd_weight: float = 1.0
     ce_weight: float = 0.1
+    # Multi-step training ("training-time test", as in EAGLE-3): unroll the draft this
+    # many steps, with a loss at each; step j sees its own earlier steps' KV. 1 = off.
+    ttt_steps: int = 1
+    ttt_decay: float = 1.0  # loss weight of step j is ttt_decay**(j-1)
+    micro_batch: Optional[int] = None  # rows per forward/backward (gradient accumulation); None = batch_size
 
 
 IntOrList = Union[int, list[int]]

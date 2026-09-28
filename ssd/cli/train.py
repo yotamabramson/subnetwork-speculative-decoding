@@ -29,7 +29,7 @@ def main(argv=None):
     p.add_argument("--config", required=True)
     p.add_argument("--stage", choices=["1", "2", "all", "online"], default="all")
     p.add_argument("--hours", type=float, help="online: stop after this many hours (default: until interrupted)")
-    p.add_argument("--init", help="online: bridge checkpoint to warm-start from")
+    p.add_argument("--init", help="online / stage 2: bridge checkpoint to warm-start from (stage 2 default: this run's stage1.pt)")
     p.add_argument("--steps", type=int, help="override steps for every stage (smoke tests)")
     p.add_argument("--output-dir", help="override training.output_dir")
     p.add_argument("--data-file", help="override data.local_path (.jsonl with messages/text, or .txt)")
@@ -68,7 +68,7 @@ def main(argv=None):
         train_stage1(cfg, base, tokenizer, max_steps=args.steps, accelerator=accelerator)
         free_device_memory()
     if args.stage in ("2", "all"):
-        train_stage2(cfg, base, tokenizer, max_steps=args.steps, accelerator=accelerator)
+        train_stage2(cfg, base, tokenizer, init_from=args.init or "stage1", max_steps=args.steps, accelerator=accelerator)
     log.info("done")
 
 

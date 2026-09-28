@@ -80,24 +80,41 @@ def train_stage2(
             target_hidden = base.model.norm(taps[L])
         labels = torch.full_like(ids, -100)
         labels[:, :-1] = ids[:, 1:]
-        true_inputs = {i: taps[i] for i in layers}
-        draft_hidden = module(ids, compute_logits=False, true_layer_inputs=true_inputs).hidden_states
-        loss, stats = chunked_distill_loss(
-            base.lm_head,
-            draft_hidden,
-            target_hidden,
-            labels,
-            s2.temperature,
-            s2.kd_weight,
-            s2.ce_weight,
-        )
-        stats = {"loss": loss.item(), **stats}
 
         opt.zero_grad(set_to_none=True)
-        if accelerator is not None:
-            accelerator.backward(loss)
-        else:
-            loss.backward()
+        mb = s2.micro_batch or ids.shape[0]
+        n_mb = (ids.shape[0] + mb - 1) // mb
+        stats: dict[str, float] = {}
+        for r0 in range(0, ids.shape[0], mb):
+            rows = slice(r0, r0 + mb)
+            true_inputs = {i: taps[i][rows] for i in layers}
+            if s2.ttt_steps > 1:
+                # Multi-step training: loss at every unrolled draft step; step j is
+                # only defined from position j-1 on (its chain starts at t-j+1 >= 0).
+                outs = draft.forward_unrolled(ids[rows], true_inputs, s2.ttt_steps)
+                weights = [s2.ttt_decay**j for j in range(s2.ttt_steps)]
+                loss = 0.0
+                for j, (h, w) in enumerate(zip(outs, weights)):
+                    lj, sj = chunked_distill_loss(
+                        base.lm_head, h[:, j:], target_hidden[rows, j:], labels[rows, j:],
+                        s2.temperature, s2.kd_weight, s2.ce_weight,
+                    )
+                    loss = loss + w * lj
+                    stats[f"top1_d{j + 1}"] = stats.get(f"top1_d{j + 1}", 0.0) + sj["top1_agree"] / n_mb
+                loss = loss / sum(weights)
+            else:
+                draft_hidden = module(ids[rows], compute_logits=False, true_layer_inputs=true_inputs).hidden_states
+                loss, sj = chunked_distill_loss(
+                    base.lm_head, draft_hidden, target_hidden[rows], labels[rows],
+                    s2.temperature, s2.kd_weight, s2.ce_weight,
+                )
+                for k, v in sj.items():
+                    stats[k] = stats.get(k, 0.0) + v / n_mb
+            stats["loss"] = stats.get("loss", 0.0) + loss.item() / n_mb
+            if accelerator is not None:
+                accelerator.backward(loss / n_mb)
+            else:
+                (loss / n_mb).backward()
         if draft.bridge_specs:
             torch.nn.utils.clip_grad_norm_(draft.parameters(), s2.grad_clip)
             opt.step()

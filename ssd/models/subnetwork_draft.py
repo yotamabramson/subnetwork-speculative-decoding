@@ -356,6 +356,97 @@ class SubnetworkDraftModel(nn.Module):
             layer_inputs=layer_inputs,
         )
 
+    # ------------------------------------------------- multi-step training
+    def _layer_forward_unrolled(
+        self,
+        slot: int,
+        h: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        true_input: torch.Tensor,
+        prior_kv: list[tuple[torch.Tensor, torch.Tensor]],
+        step: int,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """One layer at unrolled step ``step`` (1-based). Query t is the step-th
+        token of a draft chain that started at r = t - step + 1: it attends to
+        the target's KV for positions < r, to the draft's own KV from steps
+        1..step-1 at positions r..t-1 (``prior_kv``), and to its own KV at t.
+        Returns the layer output and this step's own (k, v)."""
+        layer = self.base.layers[slot]
+        attn = layer.self_attn
+        bsz, T, _ = h.shape
+        cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
+
+        def kv(x):
+            k = attn.k_proj(x).view(bsz, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            v = attn.v_proj(x).view(bsz, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            return k * cos + _rotate_half(k) * sin, v
+
+        residual = h
+        x = layer.input_layernorm(h)
+        q = attn.q_proj(x).view(bsz, T, self.num_heads, self.head_dim).transpose(1, 2)
+        q = q * cos + _rotate_half(q) * sin
+        k, v = kv(x)
+        k_t, v_t = kv(layer.input_layernorm(true_input.to(h.device, h.dtype)))
+
+        t = torch.arange(T, device=h.device)[:, None]
+        s = torch.arange(T, device=h.device)[None, :]
+        masks = [s <= t - step]  # target KV strictly before the chain start
+        masks += [s == t - step + i for i in range(1, step)]  # draft KV of earlier steps
+        masks.append(s == t)  # own
+        K = torch.cat([k_t] + [pk for pk, _ in prior_kv] + [k], dim=2)
+        V = torch.cat([v_t] + [pv for _, pv in prior_kv] + [v], dim=2)
+        out = F.scaled_dot_product_attention(
+            q, K, V, attn_mask=torch.cat(masks, 1), enable_gqa=self.num_heads != self.num_kv_heads
+        )
+        out = out.transpose(1, 2).reshape(bsz, T, self.num_heads * self.head_dim)
+        h = residual + attn.o_proj(out)
+        h = h + layer.mlp(layer.post_attention_layernorm(h))
+        return h, (k, v)
+
+    def forward_unrolled(
+        self,
+        input_ids: torch.Tensor,
+        true_layer_inputs: dict[int, torch.Tensor],
+        steps: int,
+        position_ids: Optional[torch.Tensor] = None,
+    ) -> list[torch.Tensor]:
+        """Multi-step training ("training-time test", as in EAGLE-3).
+
+        Returns post-norm hidden states for steps 1..``steps``, each [B, T, d].
+        Step 1 equals ``forward(..., true_layer_inputs=...)``. At step j,
+        position t plays the j-th token of a draft chain started at t-j+1, so
+        it sees the draft's own (approximate) KV for the chain's earlier tokens,
+        exactly as a depth-j tree node does at inference. Outputs at t < j-1
+        (chain would start before the sequence) are meaningless; mask them out.
+        """
+        h0 = self.base.embed_tokens(input_ids)
+        bsz, T, _ = h0.shape
+        if position_ids is None:
+            position_ids = torch.arange(T, device=h0.device).unsqueeze(0).expand(bsz, -1)
+        cos, sin = self.base.rotary_emb(h0, position_ids)
+        prior: list[list[tuple[torch.Tensor, torch.Tensor]]] = [[] for _ in self.layer_indices]
+        outs = []
+        for step in range(1, steps + 1):
+            h = h0
+            own = []
+            for slot, layer in enumerate(self.base.layers):
+                name = self._pre_layer_bridge[slot]
+                if name is not None:
+                    h = self.bridges[name](h)
+                dev = _module_device(layer)
+                h, kv = self._layer_forward_unrolled(
+                    slot, h.to(dev), cos.to(dev), sin.to(dev),
+                    true_layer_inputs[self.layer_indices[slot]], prior[slot], step,
+                )
+                own.append(kv)
+            if self._pre_norm_bridge is not None:
+                h = self.bridges[self._pre_norm_bridge](h)
+            for slot, kv in enumerate(own):
+                prior[slot].append(kv)
+            outs.append(self.base.norm(h.to(_module_device(self.base.norm))))
+        return outs
+
     # ------------------------------------------------------------ persistence
     def save_bridges(self, path: str, **meta) -> None:
         """Save bridge weights plus ``meta`` (e.g. stage, step) to ``path``."""

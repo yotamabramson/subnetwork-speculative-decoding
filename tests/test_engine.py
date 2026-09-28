@@ -132,6 +132,31 @@ def test_training_mode_with_context_prefix(base):
     torch.testing.assert_close(tail, full[:, -q:], atol=1e-4, rtol=1e-4)
 
 
+@pytest.mark.parametrize("layers", [[0, 3, 5], [1, 2, 4]])
+def test_unrolled_training_matches_chained_inference(base, layers):
+    """Multi-step training: step j at position t must equal a real draft chain
+    that starts at r = t-j+1. The target prefills ids[:r] into the shared cache,
+    then the draft processes ids[r], ids[r+1], ... one by one on top of it."""
+    from ssd.models.target_wrapper import TargetWrapper
+
+    draft = SubnetworkDraftModel(base, layers, BridgeConfig(init_std=0.05))
+    target = TargetRunner(base)
+    ids = torch.randint(0, 128, (1, 14), generator=torch.Generator().manual_seed(7))
+    steps = 4
+    with torch.no_grad():
+        taps = TargetWrapper(base)(ids, boundaries=layers, compute_logits=False).boundaries
+        unrolled = draft.forward_unrolled(ids, taps, steps)
+        torch.testing.assert_close(unrolled[0], draft(ids, true_layer_inputs=taps).hidden_states, atol=1e-5, rtol=1e-4)
+        for r in (0, 3, 9):
+            cache = target.new_cache(32)
+            if r > 0:
+                target(ids[:, :r], past_key_values=cache)
+            for j in range(1, steps + 1):
+                t = r + j - 1
+                h = draft(ids[:, t : t + 1], past_key_values=cache).hidden_states[0, -1]
+                torch.testing.assert_close(unrolled[j - 1][0, t], h, atol=1e-4, rtol=1e-4)
+
+
 def test_tree_shape_limits(base):
     draft = SubnetworkDraftModel(base, [0, 3, 5])
     cfg = TREES["pruned"]

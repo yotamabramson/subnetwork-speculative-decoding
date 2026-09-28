@@ -1,0 +1,59 @@
+# Experiment (multi-step, 2 unrolled steps): continue the self-distillation [0,7,15] checkpoint on the same self-distilled data.
+# Warm start via `ssd-train --stage 2 --init ...`.
+model:
+  base_model: meta-llama/Llama-3.2-1B-Instruct   # gated: HF_TOKEN from .env
+  torch_dtype: bfloat16
+  device: auto              # cuda > mps > cpu
+  attn_implementation: sdpa
+
+# 0-based base layers forming the draft sub-network, used for every draft step (Llama-3.2-1B has layers 0..15).
+draft_layers: [0, 7, 15]
+
+bridge:
+  mlp_type: mlp             # mlp | swiglu
+  num_layers: 2             # 2 or 3 for mlp
+  hidden_dim: null          # null -> d_model (2048); smaller = bottleneck, larger = expansion
+  activation: silu
+  bias: true
+  init_std: 1.0e-3          # output projection std -> bridge starts ~identity
+  dtype: float32
+
+data:
+  dataset: HuggingFaceH4/ultrachat_200k
+  split: train_sft
+  local_path: outputs/selfdistill_1b.jsonl   # overrides `dataset`
+  seq_len: 512
+  skip_samples: 0
+
+training:
+  output_dir: outputs/llama32_1b_ttt2
+  seed: 0
+  log_every: 20
+  save_every: 500
+  stage1:
+    steps: 1000
+    batch_size: 8
+    lr: 3.0e-4
+    warmup_steps: 50
+    alpha_mse: 1.0
+    beta_cos: 1.0
+    mode: teacher           # teacher | chained
+  stage2:
+    steps: 1000
+    batch_size: 4
+    lr: 3.0e-5
+    warmup_steps: 20
+    temperature: 2.0
+    kd_weight: 1.0
+    ce_weight: 0.1
+    ttt_steps: 2
+    micro_batch: 1
+
+drafting:
+  # Speculation tree (per-depth fields take an int or a list of length `depth`).
+  depth: 4               # K: tokens drafted ahead per round
+  branch: [3, 2, 2, 1]   # children proposed per kept node, per depth
+  width: 8               # nodes kept per depth (by cumulative draft prob); null = no cap
+  max_nodes: 24          # nodes sent to the target for verification; null = all
+  temperature: 0.0       # 0 = greedy (output identical to target greedy decoding)
+  top_p: 1.0
