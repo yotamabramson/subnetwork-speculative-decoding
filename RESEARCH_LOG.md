@@ -484,3 +484,23 @@ never drafted.
 - **Details:** `PLAN_H100_EAGLE3.md`. It has 5 open decisions: target 3.1,
   training budget, training-time test for SSD, fp16 evaluation, and an optional
   online-training extra.
+
+## 2026-09-28: plan debate (the user challenged my "EAGLE-3 will win" prior)
+
+1. **"SSD runs the real layers, and more of them, not just top-layer
+   features."** Conceded in large part. SSD's draft attends to the target's
+   true KV at layers 0, 16 and 31 for the whole prefix, and predicts through
+   the target's own last layer and head. EAGLE-3 fuses the target's low, middle
+   and high features, which is the same intuition. The real difference is
+   trained-for-purpose (~0.4B trained parameters) vs frozen-but-native. My
+   prior rested on weak 1B evidence, so **τ is now considered genuinely open.**
+2. **"Train on several steps at once" (EAGLE-3's "training-time test").** It
+   unrolls the draft k steps in training, so later steps see the draft's own
+   KV as they will at inference. SSD's training mode extends to it naturally.
+   **Decision: SSD gets it.**
+3. **"Draft cost doesn't matter if it's 6–7x cheaper."** Partly right. Draft
+   cost is paid once per depth: at K = 7, rounds cost ≈1.4 (EAGLE-3) vs ≈1.8
+   (SSD) target steps, so SSD needs ≈1.3x EAGLE-3's τ to match its speed. It's
+   a handicap of roughly 25%, not a decisive one. **Decisions:** τ and speedup
+   are both optimized and both headline (the user rejected making τ primary);
+   CUDA graphs are added for the draft path.

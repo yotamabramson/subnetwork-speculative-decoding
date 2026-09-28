@@ -1,6 +1,7 @@
 # Plan: SSD vs EAGLE-3 on Llama-3-8B-class, single H100
 
-Status: **draft, awaiting decisions (section 3)**. Written 2026-09-28.
+Status: **draft, awaiting decisions 1, 2, 4, 5 (section 3)**. Written 2026-09-28;
+decision 3 and the metrics policy were settled the same day.
 
 ## 1. Principles (set by the user)
 
@@ -49,10 +50,9 @@ Sources: the EAGLE-3 paper (arXiv 2503.01840, HTML version); the SafeAILab/EAGLE
      data and the **same token budget** as SSD. This gives an equal-compute
      comparison alongside the official upper bound, at +8–12 H100-hours.
      *(Recommended.)*
-3. **Training-time test:** EAGLE-3's multi-step training is part of their
-   method. SSD currently trains depth 1 only. Should SSD get the same
-   multi-step training (it's a training technique, not a layer choice), or
-   stay as it is?
+3. **Training-time test: DECIDED (2026-09-28), yes.** SSD gets multi-step
+   training as a real part of the method (see Phase 0). It's a training
+   technique, not a layer choice, so principle 3 is unaffected.
 4. **Precision:** evaluate everything in **fp16**, as their evaluation does.
    SSD's bridges stay fp32 for training. *(Recommended.)*
 5. **Online self-distillation:** principle 1 means the main SSD run uses the
@@ -83,6 +83,13 @@ Sources: the EAGLE-3 paper (arXiv 2503.01840, HTML version); the SafeAILab/EAGLE
   using the same `question.jsonl` files, system prompt, multi-turn handling,
   `max_new_token=1024`, 3 warmups and output format. Their `speed.py` then
   scores SSD and EAGLE-3 identically.
+- **Multi-step training ("training-time test") for SSD:** unroll the draft
+  for k steps in training (k ≈ EAGLE-3's tree depth). At step j, a position
+  attends to the target's true KV for the prefix, plus the draft's own KV from
+  its previous j−1 steps; there's a loss at every step. It extends the existing
+  `true_layer_inputs` mode (true prefix KV plus own KV on the diagonal) to a
+  widening band of draft KV. The target's forward pass is computed once, and
+  the draft's compute grows about k-fold.
 - **Checks:**
   - Tests on tiny models.
   - An end-to-end dry run on the Mac with the 1B on a few hundred
@@ -105,7 +112,13 @@ Sources: the EAGLE-3 paper (arXiv 2503.01840, HTML version); the SafeAILab/EAGLE
 ### Phase 3: train SSD `[0,16,31]` (budget per decision 2)
 - Stage 1 (short; it plateaus early), then Stage 2 on the regenerated data
   with the assistant-only mask.
-- Checkpoint regularly. Watch the depth-1 top-1 agreement on a held-out split.
+- Checkpoint regularly. Watch the top-1 agreement at every unrolled depth on a
+  held-out split.
+- **Speed work (both methods optimized, not just τ):**
+  - CUDA graphs for SSD's draft path. At batch 1, 3 layers plus 2 bridges are
+    likely limited by kernel-launch overhead rather than memory bandwidth.
+  - Profile both the draft and verify phases on the H100.
+  - Tune SSD's tree for speed, not only for τ.
 
 ### Phase 3b (if decision 2b): retrain EAGLE-3 with the same data and token budget
 - Their `eagle/traineagle3` script, or SpecForge, on 1 GPU.
@@ -117,8 +130,9 @@ Sources: the EAGLE-3 paper (arXiv 2503.01840, HTML version); the SafeAILab/EAGLE
   - EAGLE-3 equal-budget (if 3b);
   - SSD with EAGLE-3's tree settings;
   - SSD with its own best tree, reported separately.
-- **Metrics:** τ (primary, hardware-independent), speedup vs. each framework's
-  own baseline, and absolute tok/s.
+- **Metrics:** τ and speedup, both headline. **DECIDED (2026-09-28):** both are
+  optimized, and neither is secondary. τ is hardware-independent; speedup is
+  against each framework's own baseline, reported with absolute tok/s.
 
 ### Phase 5: write-up
 - Append the results table and conclusions to `RESEARCH_LOG.md`.
@@ -145,6 +159,16 @@ Sources: the EAGLE-3 paper (arXiv 2503.01840, HTML version); the SafeAILab/EAGLE
     on 8B.
 - **What the experiment answers:** how far a pure subnetwork draft (no new
   layers) is from the state of the art, under identical data and protocol.
+- **Speed arithmetic** (discussed 2026-09-28): speedup ≈ τ / (1 + K·c + v).
+  Per-step draft cost c is ≈0.045 of a target step for EAGLE-3 and ≈0.10 for
+  SSD (8B, 32k vocab). At K = 7, rounds cost ≈1.4 vs ≈1.8 target steps. SSD
+  therefore needs ≈1.3x EAGLE-3's τ to match its speed, or must close the gap
+  on the cost side (CUDA graphs, fewer steps).
+- **The information argument is closer than first stated:** SSD's draft reads
+  the target's *true* KV at layers 0, 16 and 31 for the whole prefix, and
+  predicts through the target's real last layer and head. EAGLE-3 fuses
+  low/mid/high target features. The real difference is trained-for-purpose
+  (~0.4B parameters) vs frozen-but-native (~0.65B frozen + 67M bridges).
 - **Risks:**
   - Unpublished regeneration settings (mitigated by the Phase 1 gate and a
     documented choice).
