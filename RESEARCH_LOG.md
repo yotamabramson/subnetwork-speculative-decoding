@@ -532,3 +532,48 @@ never drafted.
 | control-long | 3200 | 1 (same wall-clock as k=4) |
 
   Expected total: ~18 h.
+
+## 2026-09-29 04:45: multi-step training study results
+
+- **Setup:** the study ran 12:56 → ~04:45 without incidents (no thermal
+  warnings, memory stable).
+- **Results:** accepted tokens per round, mean over 10 prompts, greedy, 1B,
+  `[0,7,15]`, all runs from the same checkpoint on the same data:
+
+| Tree | warm start | control (1k) | k=2 (1k) | k=4 (1k) | k=6 (1k) | control-long (3.2k) |
+|---|---|---|---|---|---|---|
+| chain, depth 4 | 2.04 | 2.05 | 2.10 | 2.09 | 2.13 | 2.16 |
+| chain, depth 8 | 2.13 | 2.12 | 2.20 | 2.20 | 2.25 | 2.24 |
+| default (24 nodes) | 2.60 | 2.62 | 2.66 | 2.64 | 2.67 | 2.66 |
+| wide (48 nodes, depth 6) | 2.88 | 2.91 | 2.92 | 2.93 | 3.06 | 3.01 |
+
+- **Per-depth acceptance:** k=4 raised depths 2–4 by 2–7 points on chains,
+  with depth 1 unchanged.
+- **Mid-study reads were premature and later corrected:** at 19:54 I said k
+  didn't matter; at 01:56 I said more unrolled steps gave more gain. The
+  control-long run settles it.
+
+**Conclusions:**
+1. **At equal compute, multi-step training gave no advantage here.**
+   Single-step training for the same wall-clock as k=4 (3,200 steps, ~2 epochs
+   of the 3M-token data) matches the best multi-step run (k=6) on every tree,
+   within ~±2%. The multi-step gains were real relative to the 1,000-step
+   control, but plain longer training delivers the same.
+2. **Per training token, multi-step training is more efficient.** k=6 reached
+   control-long's level with 1/3.2 as many steps (the same 2M tokens seen once
+   vs ~6.5M token-passes). That could matter on the H100, where regenerating
+   training data with the target is itself expensive.
+3. **Why the effect is small here:** the draft's per-step top-1 agreement
+   drops only ~8 points from step 1 to step 4 (58% → 50%). So there was little
+   step-to-step distribution shift for multi-step training to fix. EAGLE-3's
+   gain may partly reflect a larger shift in its feature-regressing draft;
+   SSD's draft re-enters the real layers every step. This is a hypothesis.
+4. **All effects in this study are small (≤ +6%)** relative to data effects
+   (self-distillation +14–16%, in-domain online training +42–53%). The lever
+   that matters most on the 1B is training data, not training procedure.
+5. **Side note:** "vegetarian lasagna" on control-long reached 1.02x on the
+   depth-4 chain, the first prompt above 1x on this Mac.
+
+- **Implication for the H100 plan:** keep multi-step training (decision stands)
+  but don't expect it to be decisive. The data budget and diversity matter
+  more; the equal-budget EAGLE-3 retrain should match tokens, not steps.
