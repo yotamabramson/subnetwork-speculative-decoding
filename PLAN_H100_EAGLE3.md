@@ -175,3 +175,62 @@ Sources: the EAGLE-3 paper (arXiv 2503.01840, HTML version); the SafeAILab/EAGLE
   - The unresolved tree depth (Phase 1 settles it).
   - First CUDA run of our code.
   - The multi-turn conversion of our training data.
+
+## 7. Details verified from source code (2026-09-29)
+
+EAGLE repo pinned at commit `cb7e084`; SpecForge (their recommended trainer)
+at `c8c636f`. Both are cloned into `third_party/` (git-ignored, Apache-2.0).
+
+**Decided (2026-09-29):**
+- **Hardware:** H100 80GB, the paper's hardware, so speedups are comparable.
+- **Target:** Llama-3.1-8B-Instruct.
+- **Evaluation:** fp16.
+- **Baselines:** the official EAGLE-3 checkpoint, plus an equal-budget EAGLE-3
+  retrain.
+- **Online self-distillation:** not included.
+
+**Evaluation** (`eagle/evaluation/gen_ea_answer_llama3chat.py`):
+- **Questions:** `eagle/data/{mt_bench, humaneval, gsm8k, alpaca, sum}/question.jsonl`,
+  80 questions each (sum: 79). MT-bench has 2 turns; turn 2 includes the model's
+  own turn-1 answer.
+- **Fixed system prompt** (verbatim in the script); chat template with
+  `add_generation_prompt=True`, and `tokenizer(prompt, add_special_tokens=False)`.
+- **The effective generation cap is 512 new tokens.** `eagenerate` is called
+  without `max_new_tokens`, so its default of 512 (and `max_length` 2048)
+  applies. The script's `--max-new-token 1024` is unused.
+- **Tree:** the script defaults are `total_token=60`, `depth=5`, `top_k=10`;
+  `EaModel.from_pretrained` defaults to `depth=7`. The paper says depth 6–8.
+  **Phase 1 settles which depth reproduces τ.**
+- **Mapping to SSD's tree:** `branch=10`, `width=10`, `max_nodes=59`,
+  `depth=<same>`.
+- **Seeds and warmup:** `set_seed(0)`; 3 warmup runs on the first question;
+  `torch.manual_seed(i)` per choice.
+- **Output:** jsonl with `question_id, answer_id, model_id, tstamp` and
+  `choices[{index, turns, idxs, new_tokens, wall_time}]`.
+  - `idxs` is the last round index, so a turn has `idx+1` rounds and
+    τ = Σ new_tokens / Σ (idx+1).
+  - **`speed.py` measures differently for the two runs:** EAGLE's tok/s uses
+    the recorded `new_tokens`, while the baseline's uses re-tokenized output
+    text. We'll report both computed the same way, plus their script's number.
+
+**Training data** (`eagle/traineagle3/main.py`, SpecForge `prepare_data.py`
+and `regenerate_train_data.py`):
+- **Sources:** `Aeala/ShareGPT_Vicuna_unfiltered` (split `train`) and
+  `HuggingFaceH4/ultrachat_200k`, using `train_sft` (207,865) plus `train_gen`
+  (256,032), which is 463,897 and matches the paper's "464K".
+- **Format:** ShareGPT-style jsonl
+  (`{"id", "conversations": [{"from": "human"|"gpt", "value"}]}`), rendered
+  with the same fixed system prompt.
+- **Filtering:** conversations over **2048 tokens are dropped**, not
+  truncated.
+- **Loss mask:** assistant tokens only, via their exact offset logic. SSD
+  reuses that preprocessing code verbatim.
+- **Regeneration:** user turns are kept; each assistant turn is regenerated
+  from the conversation so far, including the model's own earlier turns.
+  SpecForge's defaults are temperature **0.7**, no top-p, `max_tokens` 4096.
+  EAGLE's own settings are unpublished, so we follow SpecForge and add EAGLE's
+  training system prompt, so responses match the setting they're trained and
+  evaluated in. **This is our documented assumption.**
+- **Size estimate:** ~532K conversations × ~3 assistant turns × a few hundred
+  tokens ≈ 0.3–0.5B generated tokens, about **8–13 H100-hours with vLLM**.
+  This is the largest cost item; measure it on a 1% sample first.

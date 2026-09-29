@@ -8,3 +8,4 @@ activations/
 *.safetensors
 .env
 .env.*
+third_party/
