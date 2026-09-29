@@ -21,10 +21,10 @@ import torch
 import torch.nn as nn
 
 from ssd.config import SSDConfig, profile_name
-from ssd.data.text_stream import batched, packed_rows
 from ssd.models.subnetwork_draft import SubnetworkDraftModel
 from ssd.models.target_wrapper import TargetWrapper
 from ssd.runtime import checkpoint_path, input_device
+from ssd.training.batches import training_steps
 from ssd.training.common import MetricLogger, make_optimizer
 from ssd.training.losses import chunked_distill_loss
 
@@ -66,7 +66,7 @@ def train_stage2(
     dev = input_device(base)
     tw = TargetWrapper(base)
     L = base.config.num_hidden_layers
-    batches = batched(packed_rows(cfg.data, tokenizer, rank, world), s2.batch_size)
+    batches = training_steps(cfg, tokenizer, s2.batch_size, s2.micro_batch, rank, world)
     if is_main:
         log.info("[stage2 %s] %.1fM params, T=%.1f, %d steps", name, sum(p.numel() for p in draft.parameters()) / 1e6, s2.temperature, steps)
     metrics = MetricLogger(f"[stage2 {name}]", cfg.training.log_every, is_main)
@@ -74,52 +74,58 @@ def train_stage2(
 
     module.train()
     for step in range(steps):
-        ids = next(batches).to(dev)
-        taps = tw(ids, boundaries=[*layers, L], compute_logits=False).boundaries
-        with torch.no_grad():
-            target_hidden = base.model.norm(taps[L])
-        labels = torch.full_like(ids, -100)
-        labels[:, :-1] = ids[:, 1:]
-
+        groups = [g.to(dev) for g in next(batches)]
+        n_total = max(1, sum(g.n_pred for g in groups))
         opt.zero_grad(set_to_none=True)
-        mb = s2.micro_batch or ids.shape[0]
-        n_mb = (ids.shape[0] + mb - 1) // mb
         stats: dict[str, float] = {}
-        for r0 in range(0, ids.shape[0], mb):
-            rows = slice(r0, r0 + mb)
-            true_inputs = {i: taps[i][rows] for i in layers}
+        tokens = 0
+        for g in groups:
+            if g.n_pred == 0:
+                continue
+            share = g.n_pred / n_total  # weight groups by their number of loss positions
+            tokens += g.n_pred
+            taps = tw(g.ids, boundaries=[*layers, L], compute_logits=False).boundaries
+            with torch.no_grad():
+                target_hidden = base.model.norm(taps[L])
+            labels = torch.full_like(g.ids, -100)
+            labels[:, :-1] = g.ids[:, 1:]
+            true_inputs = {i: taps[i] for i in layers}
             if s2.ttt_steps > 1:
                 # Multi-step training: loss at every unrolled draft step; step j is
                 # only defined from position j-1 on (its chain starts at t-j+1 >= 0).
-                outs = draft.forward_unrolled(ids[rows], true_inputs, s2.ttt_steps)
+                outs = draft.forward_unrolled(g.ids, true_inputs, s2.ttt_steps)
                 weights = [s2.ttt_decay**j for j in range(s2.ttt_steps)]
                 loss = 0.0
                 for j, (h, w) in enumerate(zip(outs, weights)):
+                    valid = g.pred.clone()
+                    valid[:, :j] = False
+                    if not bool(valid.any()):
+                        continue
                     lj, sj = chunked_distill_loss(
-                        base.lm_head, h[:, j:], target_hidden[rows, j:], labels[rows, j:],
+                        base.lm_head, h[valid], target_hidden[valid], labels[valid],
                         s2.temperature, s2.kd_weight, s2.ce_weight,
                     )
                     loss = loss + w * lj
-                    stats[f"top1_d{j + 1}"] = stats.get(f"top1_d{j + 1}", 0.0) + sj["top1_agree"] / n_mb
+                    stats[f"top1_d{j + 1}"] = stats.get(f"top1_d{j + 1}", 0.0) + sj["top1_agree"] * share
                 loss = loss / sum(weights)
             else:
-                draft_hidden = module(ids[rows], compute_logits=False, true_layer_inputs=true_inputs).hidden_states
+                draft_hidden = module(g.ids, compute_logits=False, true_layer_inputs=true_inputs).hidden_states
                 loss, sj = chunked_distill_loss(
-                    base.lm_head, draft_hidden, target_hidden[rows], labels[rows],
+                    base.lm_head, draft_hidden[g.pred], target_hidden[g.pred], labels[g.pred],
                     s2.temperature, s2.kd_weight, s2.ce_weight,
                 )
                 for k, v in sj.items():
-                    stats[k] = stats.get(k, 0.0) + v / n_mb
-            stats["loss"] = stats.get("loss", 0.0) + loss.item() / n_mb
+                    stats[k] = stats.get(k, 0.0) + v * share
+            stats["loss"] = stats.get("loss", 0.0) + loss.item() * share
             if accelerator is not None:
-                accelerator.backward(loss / n_mb)
+                accelerator.backward(loss * share)
             else:
-                (loss / n_mb).backward()
+                (loss * share).backward()
         if draft.bridge_specs:
             torch.nn.utils.clip_grad_norm_(draft.parameters(), s2.grad_clip)
             opt.step()
         sched.step()
-        metrics.update(step, steps, stats, ids.numel() * world, sched.get_last_lr()[0])
+        metrics.update(step, steps, stats, tokens * world, sched.get_last_lr()[0])
 
         if is_main and ((step + 1) % cfg.training.save_every == 0 or step + 1 == steps):
             draft.save_bridges(str(out), stage=2, step=step + 1)

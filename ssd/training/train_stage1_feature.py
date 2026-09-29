@@ -24,10 +24,10 @@ import torch
 import torch.nn as nn
 
 from ssd.config import SSDConfig, profile_name
-from ssd.data.text_stream import batched, packed_rows
 from ssd.models.subnetwork_draft import SubnetworkDraftModel
 from ssd.models.target_wrapper import TargetWrapper
 from ssd.runtime import checkpoint_path, input_device
+from ssd.training.batches import training_steps
 from ssd.training.common import MetricLogger, make_optimizer
 from ssd.training.losses import feature_loss
 
@@ -53,18 +53,25 @@ class _Chained(nn.Module):
         return self.draft(input_ids, compute_logits=False, output_bridge_states=True, true_layer_inputs=true_inputs).bridge_states
 
 
-def _activation_batches(cfg, base, tokenizer, boundaries, batch_size, rank, world) -> Iterator[tuple[torch.Tensor, dict]]:
+def _activation_batches(cfg, base, tokenizer, boundaries, batch_size, rank, world) -> Iterator[list[tuple]]:
+    """Per optimizer step: a list of (ids, taps, feat_mask) groups. feat_mask is
+    None for packed rows (every position but the first few counts)."""
     s1 = cfg.training.stage1
     if s1.activation_cache:
         from ssd.data.extract_activations import cached_batches
 
-        yield from cached_batches(s1.activation_cache, batch_size, boundaries)
+        for ids, taps in cached_batches(s1.activation_cache, batch_size, boundaries):
+            yield [(ids, taps, None)]
         return
     tw = TargetWrapper(base)
     dev = input_device(base)
-    for ids in batched(packed_rows(cfg.data, tokenizer, rank, world), batch_size):
-        ids = ids.to(dev)
-        yield ids, tw(ids, boundaries=boundaries, compute_logits=False).boundaries
+    for groups in training_steps(cfg, tokenizer, batch_size, None, rank, world):
+        step = []
+        for g in groups:
+            ids = g.ids.to(dev)
+            feat = g.feat.to(dev) if cfg.data.format == "eagle3" else None
+            step.append((ids, tw(ids, boundaries=boundaries, compute_logits=False).boundaries, feat))
+        yield step
 
 
 def train_stage1(
@@ -106,34 +113,38 @@ def train_stage1(
 
     module.train()
     for step in range(steps):
-        ids, taps = next(batches)
-        if s1.mode == "teacher":
-            preds = module(taps)
-        else:
-            dev = input_device(base)
-            preds = module(ids.to(dev), {b: t.to(dev) for b, t in taps.items()})
-        total = 0.0
-        stats: dict[str, float] = {}
-        for spec in draft.bridge_specs:
-            pred = preds[spec.name]
-            tgt = taps[spec.tgt_boundary].to(pred.device)
-            mask = torch.ones(pred.shape[:2], dtype=torch.bool, device=pred.device)
-            mask[:, : s1.skip_first_positions] = False
-            loss, st = feature_loss(pred, tgt, s1.alpha_mse, s1.beta_cos, mask)
-            total = total + loss
-            stats[f"{spec.name}.cos"] = st["cos"]
-            stats[f"{spec.name}.rel_mse"] = st["rel_mse"]
-        stats = {"loss": total.item(), **stats}
-
+        step_groups = next(batches)
         opt.zero_grad(set_to_none=True)
-        if accelerator is not None:
-            accelerator.backward(total)
-        else:
-            total.backward()
+        stats: dict[str, float] = {}
+        n_tok = 0
+        for ids, taps, feat in step_groups:
+            if s1.mode == "teacher":
+                preds = module(taps)
+            else:
+                dev = input_device(base)
+                preds = module(ids.to(dev), {b: t.to(dev) for b, t in taps.items()})
+            total = 0.0
+            for spec in draft.bridge_specs:
+                pred = preds[spec.name]
+                tgt = taps[spec.tgt_boundary].to(pred.device)
+                mask = torch.ones(pred.shape[:2], dtype=torch.bool, device=pred.device)
+                mask[:, : s1.skip_first_positions] = False
+                if feat is not None:
+                    mask &= feat.to(pred.device)
+                loss, st = feature_loss(pred, tgt, s1.alpha_mse, s1.beta_cos, mask)
+                total = total + loss
+                stats[f"{spec.name}.cos"] = stats.get(f"{spec.name}.cos", 0.0) + st["cos"] / len(step_groups)
+                stats[f"{spec.name}.rel_mse"] = stats.get(f"{spec.name}.rel_mse", 0.0) + st["rel_mse"] / len(step_groups)
+            stats["loss"] = stats.get("loss", 0.0) + total.item() / len(step_groups)
+            n_tok += ids.numel()
+            if accelerator is not None:
+                accelerator.backward(total / len(step_groups))
+            else:
+                (total / len(step_groups)).backward()
         torch.nn.utils.clip_grad_norm_(draft.parameters(), s1.grad_clip)
         opt.step()
         sched.step()
-        metrics.update(step, steps, stats, ids.numel() * world, sched.get_last_lr()[0])
+        metrics.update(step, steps, stats, n_tok * world, sched.get_last_lr()[0])
 
         if is_main and ((step + 1) % cfg.training.save_every == 0 or step + 1 == steps):
             draft.save_bridges(str(out), stage=1, step=step + 1)

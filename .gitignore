@@ -9,3 +9,6 @@ activations/
 .env
 .env.*
 third_party/
+data/
+logs/
+results/

@@ -57,7 +57,21 @@ def main(argv=None):
     tokenizer = load_tokenizer(cfg)
     log.info("draft layers %s", profile_name(cfg.draft_layers))
     if accelerator is None or accelerator.is_main_process:
-        ensure_token_freq(cfg, tokenizer)  # for drafting.draft_vocab
+        if cfg.data.format == "eagle3":
+            from pathlib import Path
+
+            import torch
+
+            from ssd.data.eagle3_data import draft_vocab
+
+            vocab_path = Path(cfg.training.output_dir) / "draft_vocab.pt"
+            if cfg.drafting.draft_vocab and not vocab_path.exists():
+                ids, cover = draft_vocab(cfg.data.local_path, tokenizer, cfg.drafting.draft_vocab, cfg.data.max_len)
+                vocab_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(ids, vocab_path)
+                log.info("draft vocab (EAGLE-style, assistant tokens): %d tokens cover %.2f%%", len(ids), 100 * cover)
+        else:
+            ensure_token_freq(cfg, tokenizer)  # for drafting.draft_vocab
 
     if args.stage == "online":
         from ssd.training.train_online import train_online

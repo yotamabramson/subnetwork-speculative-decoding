@@ -122,11 +122,17 @@ def build_draft(
     if inference and cfg.drafting.draft_vocab:
         from ssd.data.token_freq import token_freq_path, top_vocab
 
-        path = token_freq_path(cfg)
-        if not path.exists():
-            raise FileNotFoundError(f"{path} missing: run ssd-train or `python -m ssd.data.token_freq --config ...`")
-        eos = base.generation_config.eos_token_id
-        eos = set(eos if isinstance(eos, list) else [eos])
-        draft.set_vocab_subset(top_vocab(torch.load(path), cfg.drafting.draft_vocab, eos))
-        log.info("draft vocab: %d most frequent tokens", cfg.drafting.draft_vocab)
+        explicit = Path(cfg.training.output_dir) / "draft_vocab.pt"
+        if explicit.exists():  # EAGLE-style: top assistant tokens (python -m ssd.data.eagle3_data vocab)
+            ids = torch.load(explicit)[: cfg.drafting.draft_vocab]
+            draft.set_vocab_subset(ids.sort().values)
+            log.info("draft vocab: %d tokens from %s", ids.numel(), explicit)
+        else:
+            path = token_freq_path(cfg)
+            if not path.exists():
+                raise FileNotFoundError(f"{path} missing: run ssd-train or `python -m ssd.data.token_freq --config ...`")
+            eos = base.generation_config.eos_token_id
+            eos = set(eos if isinstance(eos, list) else [eos])
+            draft.set_vocab_subset(top_vocab(torch.load(path), cfg.drafting.draft_vocab, eos))
+            log.info("draft vocab: %d most frequent tokens", cfg.drafting.draft_vocab)
     return draft

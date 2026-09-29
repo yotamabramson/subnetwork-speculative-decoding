@@ -396,9 +396,13 @@ class SubnetworkDraftModel(nn.Module):
         masks.append(s == t)  # own
         K = torch.cat([k_t] + [pk for pk, _ in prior_kv] + [k], dim=2)
         V = torch.cat([v_t] + [pv for _, pv in prior_kv] + [v], dim=2)
-        out = F.scaled_dot_product_attention(
-            q, K, V, attn_mask=torch.cat(masks, 1), enable_gqa=self.num_heads != self.num_kv_heads
-        )
+        # Repeat KV heads explicitly (small here) rather than enable_gqa, so that on
+        # CUDA this masked call stays eligible for the memory-efficient SDPA kernel;
+        # the math fallback would materialize [T, (step+1)T] scores per head.
+        n_rep = self.num_heads // self.num_kv_heads
+        if n_rep > 1:
+            K, V = K.repeat_interleave(n_rep, dim=1), V.repeat_interleave(n_rep, dim=1)
+        out = F.scaled_dot_product_attention(q, K, V, attn_mask=torch.cat(masks, 1))
         out = out.transpose(1, 2).reshape(bsz, T, self.num_heads * self.head_dim)
         h = residual + attn.o_proj(out)
         h = h + layer.mlp(layer.post_attention_layernorm(h))

@@ -41,7 +41,9 @@ class DataConfig:
     split: str = "train_sft"
     messages_field: str = "messages"  # chat-format column; rendered with the tokenizer's chat template
     local_path: Optional[str] = None  # .jsonl with a messages/text field, or .txt; overrides `dataset`
-    seq_len: int = 1024  # conversations are packed into fixed-length rows
+    format: str = "packed"  # "packed" (fixed-length rows) | "eagle3" (one conversation per row, assistant-only loss)
+    max_len: int = 2048  # eagle3: conversations longer than this are dropped (as EAGLE-3 does)
+    seq_len: int = 1024  # packed: conversations are packed into fixed-length rows
     skip_samples: int = 0  # skip this many conversations first (e.g. to hold out an eval slice)
 
 
