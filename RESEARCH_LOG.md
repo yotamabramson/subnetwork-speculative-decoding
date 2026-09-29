@@ -577,3 +577,54 @@ never drafted.
 - **Implication for the H100 plan:** keep multi-step training (decision stands)
   but don't expect it to be decisive. The data budget and diversity matter
   more; the equal-budget EAGLE-3 retrain should match tokens, not steps.
+
+## 2026-09-29: Phase 0 for the H100 head-to-head (done on the Mac)
+
+- **Decisions (user):** head-to-head with EAGLE-3 on Llama-3.1-8B-Instruct,
+  as close to their experiments and data as possible. LoRA is deferred.
+  Hardware: H100 80GB (the paper's GPU). Evaluation in fp16. Baselines: the
+  official checkpoint plus an equal-budget EAGLE-3 retrain. No online training.
+- **Verified from EAGLE (@cb7e084) and SpecForge (@c8c636f) source code**
+  (details in `PLAN_H100_EAGLE3.md` §7):
+  - **The effective generation cap is 512 tokens:** `eagenerate` is called
+    without `max_new_tokens`, so the script's `--max-new-token 1024` is unused.
+  - **The tree depth is ambiguous:** the eval script defaults to 5, the model
+    class to 7, the paper says 6–8. The H100 reproduction will settle it.
+  - **The paper's "464K UltraChat" is `train_sft` + `train_gen`**
+    (207,865 + 256,032).
+  - **Regeneration** follows SpecForge's defaults (temperature 0.7), turn by
+    turn.
+  - **Loss:** soft cross-entropy vs the target's softmax at T=1, no
+    ground-truth term. SSD adopts it (`temperature 1.0, ce_weight 0`).
+  - **Training-time test:** 7 steps, weighted 0.8^i. SSD adopts it.
+  - **Draft vocabulary:** 32k, built from assistant tokens only. SSD adopts it.
+  - **Data handling:** conversations over 2048 tokens are dropped.
+- **Built:**
+  - `ssd/data/eagle3_data.py`: prepare, turn-by-turn regeneration (vLLM or
+    local), EAGLE's preprocessing ported verbatim, and the draft vocabulary.
+    A parity test runs EAGLE's original function and ours: tokens and masks
+    are identical. It also surfaced an EAGLE quirk, kept for parity: their
+    offsets also mask the last token of every non-final assistant turn.
+  - Regeneration stops early on conversations once they exceed 2048 tokens,
+    since they'd be dropped anyway. Same final data, fewer generation hours.
+  - Training format `eagle3`: one conversation per row, loss on assistant
+    tokens only, for both stages and multi-step training.
+  - `ssd/benchmark/eagle_bench.py`: EAGLE's evaluation protocol with SSD
+    swapped in, writing their answer format. `eagle_report.py` computes τ and
+    both speedup definitions (tok/s ratio and EAGLE's `speed.py` method).
+  - `configs/llama31_8b_eagle3.yaml`, with every setting traced to its EAGLE-3
+    source; `H100_RUNBOOK.md` with phase gates.
+- **Found and fixed during the build:**
+  - `apply_chat_template(tokenize=True)` returns a BatchEncoding in
+    transformers 5, so `len()` counted dict keys (2), not tokens (33). It would
+    have silently disabled the length cap.
+  - Multi-step attention at 2048 tokens ran out of memory on the Mac. KV
+    heads are now repeated explicitly in that path, so CUDA can use the
+    memory-efficient SDPA kernel. A full-length memory smoke test is in the
+    runbook.
+  - An O(n²) train/test split in the runbook.
+- **Dry run on the Mac (1B):** prepare → regenerate → vocabulary → Stage 1 →
+  Stage 2 (3 steps) → eagle_bench (5 benchmarks × SSD/baseline) → report. It
+  ran end to end, and the output format matches EAGLE's.
+- **Not yet verified:** the vLLM backend, EAGLE's own scripts, and CUDA memory
+  (all runbook gates).
